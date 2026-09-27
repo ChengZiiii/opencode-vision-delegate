@@ -28,6 +28,8 @@ Delegates visual tasks to subagents with a vision-capable model.
 
 You **MUST NOT** delegate to a vision subagent if the model is vision-capable. A multimodal (vision-capable) model receives image parts natively in this session: the plugin's messages transform leaves image `FilePart`s untouched on the native path, so you inspect images directly from the message rather than via a path. There is no `[vision:dropped-image]` marker for a multimodal model, and you **MUST NOT** spawn a `vision-*` subagent for it. The system prompt makes this explicit with a `[vision:native]` line; follow it.
 
+One narrow exception for multimodal models: when small text or fine detail is beyond native resolution, you MAY call `vision_analyze` WITH a `region` argument to zoom into that area of an image FILE on disk. The zoom assist needs a file path — user-dropped images were attached natively and were NOT materialized to disk, so the assist applies to tool-output screenshots and user-provided paths only.
+
 ## Step 1. Detect
 
 Visual intent arrives from four sources. Recognize all four.
@@ -157,7 +159,7 @@ Before delegating, check whether a model override is set on `vision-agent`. If t
 
 The plugin registers `vision-agent` without a model; opencode falls back to the default model when none is set.
 
-**Routing note (tool-first):** delegate by calling the `vision_analyze` tool first (Step 5, path 1). Fall back to spawning the `vision-agent` subagent (Step 5, path 2) ONLY when the tool is not present in the current session's toolset, or the tool call fails with a provider, protocol, or HTTP error. A "model not configured" error from the tool must NOT trigger the fallback — surface it and direct the user to set `agent["vision-agent"].model`.
+**Routing note (tool-first):** delegate by calling the `vision_analyze` tool first (Step 5, path 1). Fall back to spawning the `vision-agent` subagent (Step 5, path 2) ONLY when the tool is not present in the current session's toolset, or the tool call fails with a provider, protocol, or HTTP error. A "model not configured" error from the tool must NOT trigger the fallback — surface it and direct the user to set `agent["vision-agent"].model`. A `crop error` must NOT trigger retry or fallback either — it is a deterministic local failure (non-PNG image with `region`, unsupported PNG variant, or an empty region); report the error and its fix to the user (re-call without `region`, or convert the image to PNG).
 
 ## Disabling the vision subagent
 
@@ -171,7 +173,7 @@ When the tool is present in the current session's toolset (text-only orchestrato
 
 ```js
 vision_analyze({
-  images: [{ id: "<short contract id>", path: "<local image path>" }],
+  images: [{ id: "<short contract id>", path: "<local image path>", region: [x1, y1, x2, y2] /* optional, see zoom workflow */ }],
   question: "<the exact visual question>",
   response_template: "<JSON string defining the required response shape>",
   response_rules: "<optional task-specific constraints>"
@@ -182,14 +184,26 @@ You **MUST** assign each image a short contract ID such as `current`, `before`, 
 
 You **MUST** develop the `response_template` and `response_rules` per the template-design principles below. The tool reads the listed image files in-process (no subagent nesting) and returns exactly one JSON object matching the template.
 
-### Path 2 — Fallback: spawn the `vision-agent` subagent
+**Zoom workflow (optional per-image `region` crop):**
+
+`region` is `[x1, y1, x2, y2]` — integer pixel coordinates in the ORIGINAL image, `x2`/`y2` exclusive, clamped to the image bounds. PNG only (detected by file signature, not extension; cropped entries are submitted as `image/png`). The tool crops the region IN MEMORY at full source resolution, so provider-side downsampling never applies to the crop.
+
+When the answer may hinge on detail beyond a full-image pass (small text, tiny UI elements, dense tables):
+
+1. Call `vision_analyze` on the full image first, with a template that asks for the coordinates of the relevant area as numbers (original-image pixel space).
+2. If the judgment reports unreadable detail or an area of interest, re-call `vision_analyze` with `region` covering the reported area plus margin (e.g. ±40px; clamping is automatic).
+3. The tool automatically appends a coordinate-mapping note to the request for cropped images: the vision model reports coordinates in ORIGINAL-image pixel space, so you can chain further zooms or cite locations directly without arithmetic.
+
+### Path 2 — Fallback and advanced delegation: the `vision-agent` subagent
 
 Fall back to spawning the single `vision-agent` subagent with the full visual task prompt ONLY when:
 
 - the `vision_analyze` tool is not present in the current session's toolset, or
 - the tool call fails with a provider, protocol, or HTTP error (e.g. `vision_analyze: provider error: ...`).
 
-A "model not configured" error (`vision_analyze: model not configured: ...`) MUST NOT trigger the fallback — report it to the user and ask them to set `agent["vision-agent"].model`.
+A "model not configured" error (`vision_analyze: model not configured: ...`) MUST NOT trigger the fallback — report it to the user and ask them to set `agent["vision-agent"].model`. A `crop error` MUST NOT either — report it with its fix (re-call without `region`, or convert the image to PNG).
+
+Beyond those fallback conditions, you MAY delegate a whole investigation to `vision-agent` as the **advanced option**: multi-image sweeps or deep zoom chains that would otherwise spend many of your own tool turns. The subagent can read the image files natively and can call `vision_analyze` (including `region` crops) in its own loop before returning its single final JSON. For bounded single questions, keep the direct tool call.
 
 The subagent type is always `"vision-agent"` — it is a constant, not a per-model name — and its model is configured by the user via the opencode agent model override (the plugin registers it without a model):
 
@@ -257,7 +271,7 @@ Good templates usually include:
 - `uncertainty` or `limitations` when the task can fail partially.
 
 Avoid generic catch-all fields such as `observations` unless the user asked for an open-ended list.
-Avoid asking for pixel precision unless the screenshot context actually supports it.
+Avoid asking for pixel precision unless the screenshot context actually supports it — coordinates ARE supported on the zoom path: a full-image call may ask for an approximate bounding box to drive a `region` re-call, and cropped calls receive the coordinate-mapping note so their coordinates come back in original-image pixel space.
 
 **MUST:**
 
