@@ -488,3 +488,53 @@ test("postVisionRequest: timeoutMs <= 0 composes no timeout signal", async () =>
     globalThis.fetch = original
   }
 })
+
+test("buildVisionRequest: per-image mime override (VT-8 cropped entries)", () => {
+  const cropped = [
+    { id: "c", path: "/tmp/actually-png.jpg", base64: PNG, mime: "image/png" },
+  ]
+  const openai = buildVisionRequest("m", "https://api.example.com/v1", cropped, "q", "{}")
+  const body = JSON.parse(openai.body)
+  assert.equal(body.messages[0].content[1].image_url.url.startsWith("data:image/png;base64,"), true)
+
+  const anthropic = buildVisionRequest("m", "https://api.example.com/anthropic/v1", cropped, "q", "{}")
+  const abody = JSON.parse(anthropic.body)
+  assert.equal(abody.messages[0].content[1].source.media_type, "image/png")
+
+  // No mime field -> extension inference (pre-change behavior)
+  const plain = buildVisionRequest("m", "https://api.example.com/v1", images, "q", "{}")
+  const pbody = JSON.parse(plain.body)
+  assert.equal(pbody.messages[0].content[1].image_url.url.startsWith("data:image/png;base64,"), true)
+  assert.equal(pbody.messages[1].content[0].image_url.url.startsWith("data:image/jpeg;base64,"), true)
+})
+
+test("buildVisionRequest: region-free golden body (VT-8 backward compat)", () => {
+  const req = buildVisionRequest(
+    "MiniMax-M3",
+    "https://api.minimaxi.com/anthropic/v1",
+    [{ id: "a", path: "/tmp/shot.png", base64: "QUJD" }],
+    "Is the button centered?",
+    "{\n  \"isCentered\": true\n}",
+    "Report evidence.",
+    "k",
+  )
+  assert.equal(req.url, "https://api.minimaxi.com/anthropic/v1/messages")
+  assert.equal(req.headers["x-api-key"], "k")
+  assert.deepEqual(JSON.parse(req.body), {
+    model: "MiniMax-M3",
+    max_tokens: 8192,
+    temperature: 0.1,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "Is the button centered?\n\nReturn exactly one JSON object shaped like this. Keep these keys exactly, replace placeholder values with observed values, and do not add keys:\n\n{\n  \"isCentered\": true\n}\n\nResponse rules:\nReport evidence.",
+          },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } },
+        ],
+      },
+    ],
+  })
+})
