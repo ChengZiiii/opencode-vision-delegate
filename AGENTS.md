@@ -65,6 +65,11 @@
    $env:OPENCODE_TEST_HOME  = "<临时>/home"   # 仅影响插件内的目录解析
    opencode
    ```
+   注意：这只隔离 **opencode 运行时**。`opencode plugin` 安装器子命令
+   无视 `OPENCODE_CONFIG_DIR`，`--global` 永远写真实全局配置（含
+   `git+file://`/tgz 源，JSONC 注释无损但会追加条目）——沙盒里测安装
+   要手写临时 config 引用插件 spec，不要用安装器（详见避坑文档 4.5
+   第 5 条）。
 4. **终验强制官方安装模式**：任何合并/发布的改动，终验必须走
    `opencode plugin github:ChengZiiii/opencode-vision-delegate --global
    [--force]` → agent list / 冒烟全过才算完；`file://` 只算内环便利，
@@ -142,7 +147,10 @@ bun run bundle
 三种方式任选其一（插件 id 均为 `"vision"`，**并存会重复注册冲突**）：
 
 - **npm（主推）**：`opencode plugin opencode-vision-delegate --global` 安装并自动
-  patch `~/.config/opencode/opencode.json` 的 `plugin` 数组。升级加 `--force`。
+  patch `~/.config/opencode/opencode.json` 的 `plugin` 数组。**版本升级必须删
+  store 目录后重装**（`--force` 会沿用首次安装钉死的版本号，拉不到新版本；
+  npm spec 可能有 `<name>` 与 `<name>@latest` 两个 store 目录，都要删），
+  细见 README 升级章节与避坑文档第 5 节。
 - **GitHub 源（已实机验证）**：`opencode plugin
   github:ChengZiiii/opencode-vision-delegate --global`，走同一 store；分支/标签
   用 `#<ref>`。registry 安装最稳（tarball 路径完全不进 git 准备流程）。

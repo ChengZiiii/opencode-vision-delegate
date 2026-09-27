@@ -62,7 +62,16 @@ Do not mix install methods for the same plugin id (`vision`) — they would doub
 
 ### Updating / uninstalling
 
-Re-run the install command **with `--force`** to replace the installed version (`opencode plugin opencode-vision-delegate --global --force`), then restart opencode.
+To upgrade to a newly published version, `--force` alone is NOT enough: the package store pins the exact version at first install and a forced reinstall reuses it (verified on 0.1.0 → 0.2.0). Delete the store directory (or directories) first, then reinstall:
+
+```bash
+# remove every store dir for the npm spec — note there may be TWO:
+# ~/.cache/opencode/packages/opencode-vision-delegate AND .../opencode-vision-delegate@latest
+# (the runtime loads the one your `opencode agent list` output references)
+opencode plugin opencode-vision-delegate --global
+```
+
+Then restart opencode and verify with `opencode agent list`.
 
 opencode 1.18 has **no built-in plugin uninstall command**. To uninstall manually (verified working):
 
