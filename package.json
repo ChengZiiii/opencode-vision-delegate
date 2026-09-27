@@ -1,6 +1,6 @@
 {
   "name": "opencode-vision-delegate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Visual bridge for opencode. Registers the native vision_analyze tool (model configured by the user via the opencode agent model override on vision-agent) with the vision-agent subagent as fallback, and teaches a text-only orchestrator to extract visual intent, design a task-specific JSON response template, and delegate via the tool (or subagent).",
   "type": "module",
   "main": "./dist/index.js",

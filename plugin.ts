@@ -12,6 +12,7 @@ import {
   resolveVisionApiKey,
   postVisionRequest,
 } from "./src/vision-http.ts"
+import { prepareVisionImage, VisionCropError } from "./src/vision-crop.ts"
 
 // Resolve the data dir (the skills.paths entry pointing at SKILL.md) relative
 // to the bundle. When run from source, `import.meta.url` is plugin.ts and
@@ -37,6 +38,7 @@ The prompt contains a Visual Task (the exact visual question), Images to Inspect
 
 - Report what you actually observe; do not guess. Be specific: positions, colors, sizes, alignment, visibility, ordering, etc.
 - Include visual evidence wherever the template provides an evidence field; use \`null\` for facts that cannot be determined when the template permits null.
+- For fine detail (small text, tiny UI elements) that your native view of an image cannot resolve, you MAY call the \`vision_analyze\` tool with a \`region\` crop [x1, y1, x2, y2] to zoom into that area before answering.
 - If an image cannot be analyzed (corrupted, wrong format, file not found, or unsupported image modality), fill the template's uncertainty/failure fields honestly, preserving the exact template shape.
 - Choose one concrete value for enum-like placeholders such as \`"pass | fail | inconclusive"\`.
 - Emit exactly one JSON object: no prose, markdown fences, commentary, or extra keys.
@@ -469,15 +471,21 @@ function visionAnalyzeTool() {
   return tool({
     description:
       "Performs a visual judgment on local image files with the configured vision model. " +
-      "Pass `images` as [{id, path}] (short contract ids plus local image paths), the exact visual " +
+      "Pass `images` as [{id, path, region?}] (short contract ids plus local image paths), the exact visual " +
       "`question`, a `response_template` (JSON string defining the required response shape), and " +
       "optional `response_rules` for task-specific constraints. Returns exactly one JSON object " +
-      "matching the response template.",
+      "matching the response template. Optional per-image `region: [x1, y1, x2, y2]` (integer pixel " +
+      "coordinates in the ORIGINAL image, x2/y2 exclusive, PNG only) crops that region in memory at " +
+      "full resolution — load the full image first, then re-call with a region to zoom into small " +
+      "text or fine detail.",
     args: {
       images: tool.schema.array(
         tool.schema.object({
           id: tool.schema.string(),
           path: tool.schema.string(),
+          region: tool.schema.optional(
+            tool.schema.array(tool.schema.number().int()).min(4).max(4),
+          ),
         }),
       ),
       question: tool.schema.string(),
@@ -520,19 +528,44 @@ function visionAnalyzeTool() {
         process.env,
       )
       if (!apiKey.ok) throw new Error(`vision_analyze: provider error: ${apiKey.error}`)
-      const images: { id: string; path: string; base64: string }[] = []
+      const images: { id: string; path: string; base64: string; mime?: string }[] = []
+      const disclosures: string[] = []
       for (const image of args.images) {
         const path = isAbsolute(image.path) ? image.path : join(ctx.directory, image.path)
         if (!existsSync(path)) {
           throw new Error(`vision_analyze: missing image: ${path}`)
         }
-        images.push({ id: image.id, path, base64: readFileSync(path).toString("base64") })
+        // Region crop (VT-8) runs inside the existing read loop — error
+        // precedence (disabled -> model not configured -> provider error ->
+        // missing image -> crop error) is unchanged for region-free calls.
+        let prepared
+        try {
+          prepared = prepareVisionImage({ id: image.id, path, region: image.region })
+        } catch (error) {
+          if (error instanceof VisionCropError) {
+            throw new Error(`vision_analyze: crop error: ${error.message}`)
+          }
+          throw error
+        }
+        if (prepared.disclosure) disclosures.push(prepared.disclosure)
+        images.push({
+          id: prepared.id,
+          path: prepared.path,
+          base64: prepared.base64,
+          ...(prepared.mime ? { mime: prepared.mime } : {}),
+        })
       }
+      // Coordinate disclosure rides the prompt (VT-8): cropped images come
+      // back with coordinates already in original-image space; the tool's
+      // response contract stays exactly one template-matching JSON object.
+      const question = disclosures.length
+        ? `${args.question}\n\nRegion crop coordinate mapping:\n${disclosures.join("\n")}`
+        : args.question
       const request = buildVisionRequest(
         parts.modelID,
         endpoint.value,
         images,
-        args.question,
+        question,
         args.response_template,
         args.response_rules,
         apiKey.value,
@@ -729,8 +762,10 @@ const plugin: Plugin = async () => ({
     if (capable) {
       output.system.push(
         "[vision:native] You receive image parts natively in this session. " +
-          "Inspect images directly from the message. Do NOT use the vision skill, " +
-          "do NOT delegate visual tasks to a vision-* subagent.",
+          "Inspect images directly from the message. Do NOT use the vision skill for plain reading " +
+          "and do NOT delegate visual tasks to a vision-* subagent. Exception: when small text or " +
+          "fine detail is beyond native resolution, you MAY call vision_analyze WITH a `region` " +
+          "argument to zoom into that area of an image FILE on disk.",
       )
       return
     }

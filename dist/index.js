@@ -12334,7 +12334,7 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // plugin.ts
-import { readFileSync, existsSync, writeFileSync, copyFileSync, mkdirSync } from "node:fs";
+import { readFileSync as readFileSync2, existsSync, writeFileSync, copyFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve, isAbsolute } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -12411,7 +12411,7 @@ ${responseRules}`);
 `);
   const messages = [];
   for (const image of images) {
-    const mime = inferImageMime(image.path);
+    const mime = image.mime ?? inferImageMime(image.path);
     if (shape === "anthropic") {
       const content = [];
       if (messages.length === 0 && text) {
@@ -12681,6 +12681,354 @@ async function postVisionRequest(request, opts = {}) {
   }
 }
 
+// src/vision-crop.ts
+import { readFileSync } from "node:fs";
+import { inflateSync, deflateSync } from "node:zlib";
+
+class VisionCropError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "VisionCropError";
+  }
+}
+var MAX_PIXELS = 40000000;
+var PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+var CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0;n < 256; n++) {
+    let c = n;
+    for (let k = 0;k < 8; k++)
+      c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(buf) {
+  let c = 4294967295;
+  for (let i = 0;i < buf.length; i++)
+    c = CRC_TABLE[(c ^ buf[i]) & 255] ^ c >>> 8;
+  return (c ^ 4294967295) >>> 0;
+}
+var CHANNELS_BY_COLOR_TYPE = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+function decodePng(png) {
+  if (png.length < 8 || !png.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    throw new VisionCropError("region crop supports PNG images only and this file does not carry the PNG signature. " + "Fix: call again without `region`, or convert the image to PNG first");
+  }
+  let pos = 8;
+  let width = 0;
+  let height = 0;
+  let bitDepth = -1;
+  let colorType = -1;
+  let interlace = -1;
+  let palette;
+  let trns;
+  const idatParts = [];
+  let sawIhdr = false;
+  let sawIend = false;
+  while (pos < png.length && !sawIend) {
+    if (pos + 8 > png.length)
+      throw new VisionCropError("truncated PNG (chunk header)");
+    const length = png.readUInt32BE(pos);
+    const type = png.toString("ascii", pos + 4, pos + 8);
+    const dataStart = pos + 8;
+    const dataEnd = dataStart + length;
+    if (dataEnd + 4 > png.length)
+      throw new VisionCropError(`truncated PNG (${type} chunk)`);
+    const data = png.subarray(dataStart, dataEnd);
+    if (type === "IHDR") {
+      const crcBuf = png.subarray(pos + 4, dataEnd);
+      if (crc32(crcBuf) !== png.readUInt32BE(dataEnd)) {
+        throw new VisionCropError("corrupted PNG (IHDR CRC mismatch)");
+      }
+      if (length !== 13)
+        throw new VisionCropError("corrupted PNG (IHDR length)");
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      bitDepth = data[8];
+      colorType = data[9];
+      if (data[10] !== 0 || data[11] !== 0) {
+        throw new VisionCropError("unsupported PNG compression/filter method");
+      }
+      interlace = data[12];
+      sawIhdr = true;
+    } else if (type === "PLTE") {
+      palette = data;
+    } else if (type === "tRNS") {
+      trns = data;
+    } else if (type === "IDAT") {
+      idatParts.push(data);
+    } else if (type === "IEND") {
+      sawIend = true;
+    } else if (type[0] >= "A" && type[0] <= "Z") {
+      throw new VisionCropError(`unsupported critical PNG chunk ${type}. Fix: call again without \`region\`, or re-save the image as a standard PNG`);
+    }
+    pos = dataEnd + 4;
+  }
+  if (!sawIhdr)
+    throw new VisionCropError("corrupted PNG (no IHDR chunk)");
+  if (idatParts.length === 0)
+    throw new VisionCropError("corrupted PNG (no IDAT chunks)");
+  if (bitDepth !== 8) {
+    throw new VisionCropError(`unsupported PNG bit depth ${bitDepth} (only 8-bit is supported for region crop). ` + "Fix: call again without `region`, or re-save the image as an 8-bit PNG");
+  }
+  const channels = CHANNELS_BY_COLOR_TYPE[colorType];
+  if (channels === undefined) {
+    throw new VisionCropError(`unsupported PNG color type ${colorType} (supported: 0 gray, 2 RGB, 3 palette, 4 gray+alpha, 6 RGBA). ` + "Fix: call again without `region`, or convert the image to RGB(A) PNG");
+  }
+  if (colorType === 3 && (!palette || palette.length === 0 || palette.length % 3 !== 0)) {
+    throw new VisionCropError("corrupted PNG (palette image without a valid PLTE chunk)");
+  }
+  if (interlace !== 0) {
+    throw new VisionCropError("interlaced PNG (Adam7) is not supported for region crop. " + "Fix: call again without `region`, or re-save as a non-interlaced PNG (the default of every screenshot tool)");
+  }
+  if (width <= 0 || height <= 0)
+    throw new VisionCropError(`corrupted PNG (dimensions ${width}x${height})`);
+  if (width * height > MAX_PIXELS) {
+    throw new VisionCropError(`image is ${width}x${height} (${(width * height / 1e6).toFixed(1)} MP); the crop guard rejects images over ${MAX_PIXELS / 1e6} MP. Fix: crop from a smaller screenshot or downscale the source image first`);
+  }
+  let raw;
+  try {
+    raw = inflateSync(Buffer.concat(idatParts));
+  } catch (error45) {
+    const message = error45 instanceof Error ? error45.message : String(error45);
+    throw new VisionCropError(`corrupted PNG (IDAT): ${message}`);
+  }
+  const stride = width * channels;
+  const expected = height * (1 + stride);
+  if (raw.length < expected) {
+    throw new VisionCropError(`corrupted PNG (decoded ${raw.length} bytes, expected ${expected})`);
+  }
+  const pixels = unfilter(raw, width, height, channels);
+  const rgba = toRgba(pixels, width, height, colorType, palette, trns);
+  return { width, height, rgba };
+}
+function paeth(a, b, c) {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc)
+    return a;
+  if (pb <= pc)
+    return b;
+  return c;
+}
+function unfilter(raw, width, height, bpp) {
+  const stride = width * bpp;
+  const out = new Uint8Array(height * stride);
+  let pos = 0;
+  for (let y = 0;y < height; y++) {
+    if (pos >= raw.length)
+      throw new VisionCropError("corrupted PNG (scanline truncated)");
+    const filter = raw[pos++];
+    const rowStart = y * stride;
+    for (let i = 0;i < stride; i++) {
+      if (pos >= raw.length)
+        throw new VisionCropError("corrupted PNG (scanline truncated)");
+      const x = raw[pos++];
+      const a = i >= bpp ? out[rowStart + i - bpp] : 0;
+      const b = y > 0 ? out[rowStart - stride + i] : 0;
+      const c = i >= bpp && y > 0 ? out[rowStart - stride + i - bpp] : 0;
+      let v;
+      switch (filter) {
+        case 0:
+          v = x;
+          break;
+        case 1:
+          v = x + a;
+          break;
+        case 2:
+          v = x + b;
+          break;
+        case 3:
+          v = x + (a + b >> 1);
+          break;
+        case 4:
+          v = x + paeth(a, b, c);
+          break;
+        default:
+          throw new VisionCropError(`corrupted PNG (row filter type ${filter})`);
+      }
+      out[rowStart + i] = v & 255;
+    }
+  }
+  return out;
+}
+function toRgba(pixels, width, height, colorType, palette, trns) {
+  const count = width * height;
+  const rgba = new Uint8Array(count * 4);
+  const grayKey = colorType === 0 && trns && trns.length >= 2 ? trns[1] : undefined;
+  const keyR = colorType === 2 && trns && trns.length >= 6 ? trns[1] : undefined;
+  const keyG = colorType === 2 && trns && trns.length >= 6 ? trns[3] : undefined;
+  const keyB = colorType === 2 && trns && trns.length >= 6 ? trns[5] : undefined;
+  for (let i = 0;i < count; i++) {
+    const o = i * 4;
+    const s = i * CHANNELS_BY_COLOR_TYPE[colorType];
+    switch (colorType) {
+      case 0: {
+        const g = pixels[s];
+        rgba[o] = g;
+        rgba[o + 1] = g;
+        rgba[o + 2] = g;
+        rgba[o + 3] = grayKey !== undefined && g === grayKey ? 0 : 255;
+        break;
+      }
+      case 2: {
+        const r = pixels[s];
+        const g = pixels[s + 1];
+        const b = pixels[s + 2];
+        rgba[o] = r;
+        rgba[o + 1] = g;
+        rgba[o + 2] = b;
+        rgba[o + 3] = keyR !== undefined && r === keyR && g === keyG && b === keyB ? 0 : 255;
+        break;
+      }
+      case 3: {
+        const idx = pixels[s];
+        const p = idx * 3;
+        rgba[o] = palette[p] ?? 0;
+        rgba[o + 1] = palette[p + 1] ?? 0;
+        rgba[o + 2] = palette[p + 2] ?? 0;
+        rgba[o + 3] = trns && idx < trns.length ? trns[idx] : 255;
+        break;
+      }
+      case 4: {
+        const g = pixels[s];
+        rgba[o] = g;
+        rgba[o + 1] = g;
+        rgba[o + 2] = g;
+        rgba[o + 3] = pixels[s + 1];
+        break;
+      }
+      case 6: {
+        rgba[o] = pixels[s];
+        rgba[o + 1] = pixels[s + 1];
+        rgba[o + 2] = pixels[s + 2];
+        rgba[o + 3] = pixels[s + 3];
+        break;
+      }
+    }
+  }
+  return rgba;
+}
+function cropRgba(rgba, width, height, region) {
+  const clamp = (v, max) => Math.max(0, Math.min(v, max));
+  const x1 = clamp(region[0], width);
+  const y1 = clamp(region[1], height);
+  const x2 = clamp(region[2], width);
+  const y2 = clamp(region[3], height);
+  if (x2 <= x1 || y2 <= y1) {
+    throw new VisionCropError(`region is empty after clamping to the ${width}x${height} image (got x:[${x1},${x2}), y:[${y1},${y2})). ` + "Fix: pass a non-empty [x1, y1, x2, y2] rectangle inside the image (x2/y2 exclusive)");
+  }
+  const w = x2 - x1;
+  const h = y2 - y1;
+  const out = new Uint8Array(w * h * 4);
+  for (let y = 0;y < h; y++) {
+    const src = ((y1 + y) * width + x1) * 4;
+    out.set(rgba.subarray(src, src + w * 4), y * w * 4);
+  }
+  return { rgba: out, width: w, height: h, originX: x1, originY: y1 };
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, "ascii");
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
+function encodePng(width, height, rgba) {
+  let hasAlpha = false;
+  for (let i = 3;i < rgba.length; i += 4) {
+    if (rgba[i] !== 255) {
+      hasAlpha = true;
+      break;
+    }
+  }
+  const channels = hasAlpha ? 4 : 3;
+  const colorType = hasAlpha ? 6 : 2;
+  const stride = width * channels;
+  const raw = Buffer.alloc(height * (1 + stride));
+  let pos = 0;
+  for (let y = 0;y < height; y++) {
+    raw[pos++] = 0;
+    for (let x = 0;x < width; x++) {
+      const s = (y * width + x) * 4;
+      raw[pos++] = rgba[s];
+      raw[pos++] = rgba[s + 1];
+      raw[pos++] = rgba[s + 2];
+      if (hasAlpha)
+        raw[pos++] = rgba[s + 3];
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = colorType;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  const idat = deflateSync(raw, { level: 6 });
+  return Buffer.concat([
+    PNG_SIGNATURE,
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", idat),
+    pngChunk("IEND", Buffer.alloc(0))
+  ]);
+}
+function cropPngToBase64(png, region) {
+  const decoded = decodePng(png);
+  const cropped = cropRgba(decoded.rgba, decoded.width, decoded.height, region);
+  const encoded = encodePng(cropped.width, cropped.height, cropped.rgba);
+  return {
+    base64: encoded.toString("base64"),
+    cropWidth: cropped.width,
+    cropHeight: cropped.height,
+    originX: cropped.originX,
+    originY: cropped.originY
+  };
+}
+function validateRegion(value) {
+  if (value === undefined)
+    return;
+  if (!Array.isArray(value) || value.length !== 4 || value.some((v) => !Number.isInteger(v))) {
+    throw new VisionCropError(`region must be exactly 4 integers [x1, y1, x2, y2], got ${JSON.stringify(value)}. ` + "Fix: pass integer pixel coordinates (x2/y2 exclusive)");
+  }
+  return value;
+}
+function regionDisclosureLine(result, id) {
+  return `Image "${id}" is a crop of its original image: origin (${result.originX}, ${result.originY}), ` + `size ${result.cropWidth}x${result.cropHeight}, covering pixels [${result.originX},${result.originY}) ` + `to [${result.originX + result.cropWidth},${result.originY + result.cropHeight}) in original pixel coordinates. ` + "For this image, report any coordinates in ORIGINAL-image pixel space: " + `add (${result.originX}, ${result.originY}) to positions you observe within the crop.`;
+}
+function prepareVisionImage(entry) {
+  const region = validateRegion(entry.region);
+  if (!region) {
+    return { id: entry.id, path: entry.path, base64: readFileSync(entry.path).toString("base64") };
+  }
+  let png;
+  try {
+    png = readFileSync(entry.path);
+  } catch (error45) {
+    const message = error45 instanceof Error ? error45.message : String(error45);
+    throw new VisionCropError(`image "${entry.id}" (${entry.path}): cannot read file: ${message}`);
+  }
+  try {
+    const result = cropPngToBase64(png, region);
+    return {
+      id: entry.id,
+      path: entry.path,
+      base64: result.base64,
+      mime: "image/png",
+      disclosure: regionDisclosureLine(result, entry.id)
+    };
+  } catch (error45) {
+    if (error45 instanceof VisionCropError) {
+      throw new VisionCropError(`image "${entry.id}" (${entry.path}): ${error45.message}`);
+    }
+    throw error45;
+  }
+}
+
 // plugin.ts
 var bundleDir = dirname(fileURLToPath(import.meta.url));
 var candidateDirs = [bundleDir, join(bundleDir, "..")];
@@ -12695,6 +13043,7 @@ The prompt contains a Visual Task (the exact visual question), Images to Inspect
 
 - Report what you actually observe; do not guess. Be specific: positions, colors, sizes, alignment, visibility, ordering, etc.
 - Include visual evidence wherever the template provides an evidence field; use \`null\` for facts that cannot be determined when the template permits null.
+- For fine detail (small text, tiny UI elements) that your native view of an image cannot resolve, you MAY call the \`vision_analyze\` tool with a \`region\` crop [x1, y1, x2, y2] to zoom into that area before answering.
 - If an image cannot be analyzed (corrupted, wrong format, file not found, or unsupported image modality), fill the template's uncertainty/failure fields honestly, preserving the exact template shape.
 - Choose one concrete value for enum-like placeholders such as \`"pass | fail | inconclusive"\`.
 - Emit exactly one JSON object: no prose, markdown fences, commentary, or extra keys.
@@ -12755,7 +13104,7 @@ function readModelsCatalog() {
     const file2 = opencodeModelsFile();
     if (!existsSync(file2))
       return {};
-    return JSON.parse(readFileSync(file2, "utf8"));
+    return JSON.parse(readFileSync2(file2, "utf8"));
   } catch {
     return {};
   }
@@ -12768,7 +13117,7 @@ function readAuthData() {
     const file2 = join(opencodeDataDir(), "auth.json");
     if (!existsSync(file2))
       return {};
-    return JSON.parse(readFileSync(file2, "utf8"));
+    return JSON.parse(readFileSync2(file2, "utf8"));
   } catch {
     return {};
   }
@@ -12967,11 +13316,12 @@ function mimeToExt(mime) {
 }
 function visionAnalyzeTool() {
   return tool({
-    description: "Performs a visual judgment on local image files with the configured vision model. " + "Pass `images` as [{id, path}] (short contract ids plus local image paths), the exact visual " + "`question`, a `response_template` (JSON string defining the required response shape), and " + "optional `response_rules` for task-specific constraints. Returns exactly one JSON object " + "matching the response template.",
+    description: "Performs a visual judgment on local image files with the configured vision model. " + "Pass `images` as [{id, path, region?}] (short contract ids plus local image paths), the exact visual " + "`question`, a `response_template` (JSON string defining the required response shape), and " + "optional `response_rules` for task-specific constraints. Returns exactly one JSON object " + "matching the response template. Optional per-image `region: [x1, y1, x2, y2]` (integer pixel " + "coordinates in the ORIGINAL image, x2/y2 exclusive, PNG only) crops that region in memory at " + "full resolution — load the full image first, then re-call with a region to zoom into small " + "text or fine detail.",
     args: {
       images: tool.schema.array(tool.schema.object({
         id: tool.schema.string(),
-        path: tool.schema.string()
+        path: tool.schema.string(),
+        region: tool.schema.optional(tool.schema.array(tool.schema.number().int()).min(4).max(4))
       })),
       question: tool.schema.string(),
       response_template: tool.schema.string(),
@@ -13000,14 +13350,36 @@ function visionAnalyzeTool() {
       if (!apiKey.ok)
         throw new Error(`vision_analyze: provider error: ${apiKey.error}`);
       const images = [];
+      const disclosures = [];
       for (const image of args.images) {
         const path = isAbsolute(image.path) ? image.path : join(ctx.directory, image.path);
         if (!existsSync(path)) {
           throw new Error(`vision_analyze: missing image: ${path}`);
         }
-        images.push({ id: image.id, path, base64: readFileSync(path).toString("base64") });
+        let prepared;
+        try {
+          prepared = prepareVisionImage({ id: image.id, path, region: image.region });
+        } catch (error45) {
+          if (error45 instanceof VisionCropError) {
+            throw new Error(`vision_analyze: crop error: ${error45.message}`);
+          }
+          throw error45;
+        }
+        if (prepared.disclosure)
+          disclosures.push(prepared.disclosure);
+        images.push({
+          id: prepared.id,
+          path: prepared.path,
+          base64: prepared.base64,
+          ...prepared.mime ? { mime: prepared.mime } : {}
+        });
       }
-      const request = buildVisionRequest(parts.modelID, endpoint.value, images, args.question, args.response_template, args.response_rules, apiKey.value, { temperature: visionToolTemperature, extraBody: visionToolExtraBody });
+      const question = disclosures.length ? `${args.question}
+
+Region crop coordinate mapping:
+${disclosures.join(`
+`)}` : args.question;
+      const request = buildVisionRequest(parts.modelID, endpoint.value, images, question, args.response_template, args.response_rules, apiKey.value, { temperature: visionToolTemperature, extraBody: visionToolExtraBody });
       const result = await postVisionRequest(request, {
         signal: ctx.abort,
         timeoutMs: resolveVisionToolTimeoutMs()
@@ -13109,7 +13481,7 @@ var plugin = async () => ({
     const model = input.model;
     const capable = Boolean(model && typeof model.providerID === "string" && typeof model.id === "string" && visionModelKeys.has(`${model.providerID}/${model.id}`.toLowerCase()));
     if (capable) {
-      output.system.push("[vision:native] You receive image parts natively in this session. " + "Inspect images directly from the message. Do NOT use the vision skill, " + "do NOT delegate visual tasks to a vision-* subagent.");
+      output.system.push("[vision:native] You receive image parts natively in this session. " + "Inspect images directly from the message. Do NOT use the vision skill for plain reading " + "and do NOT delegate visual tasks to a vision-* subagent. Exception: when small text or " + "fine detail is beyond native resolution, you MAY call vision_analyze WITH a `region` " + "argument to zoom into that area of an image FILE on disk.");
       return;
     }
   }

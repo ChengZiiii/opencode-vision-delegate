@@ -17,6 +17,14 @@ export type VisionImage = {
   id: string
   path: string
   base64: string
+  /**
+   * Optional mime override. Absent on passthrough entries (mime inferred
+   * from the path extension, pre-change behavior); region-cropped entries
+   * always carry "image/png" regardless of the original extension, because
+   * the crop payload is a re-encoded PNG even when the source path says
+   * .jpg/.webp (PNG-ness is detected by signature, see src/vision-crop.ts).
+   */
+  mime?: string
 }
 
 export type VisionRequest = {
@@ -145,7 +153,7 @@ export function buildVisionRequest(
 
   const messages: unknown[] = []
   for (const image of images) {
-    const mime = inferImageMime(image.path)
+    const mime = image.mime ?? inferImageMime(image.path)
     if (shape === "anthropic") {
       const content: unknown[] = []
       if (messages.length === 0 && text) {
