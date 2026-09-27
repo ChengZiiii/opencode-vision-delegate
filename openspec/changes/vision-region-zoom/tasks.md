@@ -74,7 +74,7 @@
       temp dirs): `vision_analyze` region call on a synthetic PNG against a
       stubbed provider succeeds; crop error on JPEG+region surfaces with
       the documented prefix
-- [ ] 4.3 Final verification in official install mode per AGENTS.md:
+- [x] 4.3 Final verification in official install mode per AGENTS.md:
       `opencode plugin github:ChengZiiii/opencode-vision-delegate --global
       --force` (or npm-name install), restart, `opencode agent list` shows
       exactly one `vision-agent`, and a live zoom round-trip
