@@ -12619,7 +12619,7 @@ function resolveVisionEndpoint(provider, catalog, config2, env) {
   };
 }
 var KEYLESS_PROVIDER_IDS = new Set(["opencode"]);
-function resolveVisionApiKey(provider, catalog, _config, auth, env) {
+function resolveVisionApiKey(provider, catalog, config2, auth, env) {
   const authKey = foldMatch(auth, provider);
   if (authKey) {
     const entry = auth[authKey];
@@ -12627,6 +12627,17 @@ function resolveVisionApiKey(provider, catalog, _config, auth, env) {
       const key = typeof entry.key === "string" ? entry.key : typeof entry.apiKey === "string" ? entry.apiKey : undefined;
       if (key && key.trim())
         return { ok: true, value: key.trim(), source: "auth" };
+    }
+  }
+  for (const section of [config2.provider, config2.providers]) {
+    if (!section)
+      continue;
+    const key = foldMatch(section, provider);
+    if (key) {
+      const apiKey = section[key]?.options?.apiKey;
+      if (typeof apiKey === "string" && apiKey.trim()) {
+        return { ok: true, value: apiKey.trim(), source: "config" };
+      }
     }
   }
   const catalogProvider = catalog[provider] ?? catalog[String(provider).toLowerCase()];
@@ -12641,7 +12652,7 @@ function resolveVisionApiKey(provider, catalog, _config, auth, env) {
   }
   return {
     ok: false,
-    error: `no API key for provider "${provider}": authenticate via "opencode auth login ${provider}" or set ${(catalogProvider?.env ?? ["<provider>_API_KEY"]).join(", ")}`
+    error: `no API key for provider "${provider}": authenticate via "opencode auth login ${provider}", set provider.${provider}.options.apiKey in config, or set ${(catalogProvider?.env ?? ["<provider>_API_KEY"]).join(", ")}`
   };
 }
 async function postVisionRequest(request, opts = {}) {

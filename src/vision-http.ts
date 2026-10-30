@@ -391,8 +391,8 @@ const VISION_ENDPOINTS: Record<string, string> = {
 }
 
 type ConfigLike = {
-  provider?: Record<string, { options?: { baseURL?: string } }>
-  providers?: Record<string, { options?: { baseURL?: string } }>
+  provider?: Record<string, { options?: { baseURL?: string; apiKey?: string } }>
+  providers?: Record<string, { options?: { baseURL?: string; apiKey?: string } }>
 }
 
 type RawProvider = {
@@ -466,14 +466,15 @@ const KEYLESS_PROVIDER_IDS = new Set(["opencode"])
 
 /**
  * Resolve the vision provider's API key: the provider's auth.json entry
- * (type "api") first, then the provider's declared env vars. For keyless
+ * (type "api") first, then provider.<id>.options.apiKey from config, then
+ * the provider's declared env vars. For keyless
  * gateway providers (opencode Zen) a resolved "nothing found" returns
  * success WITHOUT a key; every other provider id keeps the strict error.
  */
 export function resolveVisionApiKey(
   provider: string,
   catalog: Catalog,
-  _config: ConfigLike,
+  config: ConfigLike,
   auth: Record<string, unknown>,
   env: Record<string, string | undefined>,
 ): ResolutionResult<string | undefined> {
@@ -483,6 +484,16 @@ export function resolveVisionApiKey(
     if (entry && typeof entry === "object" && entry.type === "api") {
       const key = typeof entry.key === "string" ? entry.key : typeof entry.apiKey === "string" ? entry.apiKey : undefined
       if (key && key.trim()) return { ok: true, value: key.trim(), source: "auth" }
+    }
+  }
+  for (const section of [config.provider, config.providers]) {
+    if (!section) continue
+    const key = foldMatch(section as unknown as Record<string, unknown>, provider)
+    if (key) {
+      const apiKey = section[key]?.options?.apiKey
+      if (typeof apiKey === "string" && apiKey.trim()) {
+        return { ok: true, value: apiKey.trim(), source: "config" }
+      }
     }
   }
   const catalogProvider = catalog[provider] ?? catalog[String(provider).toLowerCase()]
@@ -497,7 +508,7 @@ export function resolveVisionApiKey(
   }
   return {
     ok: false,
-    error: `no API key for provider "${provider}": authenticate via "opencode auth login ${provider}" or set ${(catalogProvider?.env ?? ["<provider>_API_KEY"]).join(", ")}`,
+    error: `no API key for provider "${provider}": authenticate via "opencode auth login ${provider}", set provider.${provider}.options.apiKey in config, or set ${(catalogProvider?.env ?? ["<provider>_API_KEY"]).join(", ")}`,
   }
 }
 
