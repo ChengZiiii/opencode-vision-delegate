@@ -123,7 +123,7 @@ bun run bundle
    禁止把 base64 塞进命令行——截图可能含敏感内容，不能进 shell 历史。
 3. **endpoint/key 解析顺序**（勿乱改）：config `options.baseURL` → provider env
    中 `*_HOST` 类变量 → catalog `api` 字段 → 内置映射 → 明确报错。
-   key：auth.json（type `api`）→ provider env 变量。
+   key：auth.json（type `api`）→ config `options.apiKey` → provider env 变量。
 4. **开关语义**：`agent["vision-agent"].disable = true` = 一键全关（工具 + 子代理），
    这是用户唯一认可的关闭方式。
 5. **权限钩子防御式写法**：`permission.ask` 里工具名按首中优先级链检查
