@@ -290,6 +290,67 @@ test("resolveVisionApiKey: non-Zen provider without a key still errors", () => {
   if (!r.ok) assert.match(r.error, /no API key for provider "minimax-cn-coding-plan"/)
 })
 
+// VT-5 (change resolve-api-key-from-config): config options.apiKey as a key
+// source between auth.json and env.
+
+test("resolveVisionApiKey: config apiKey resolves when auth/env absent", () => {
+  const catalog = { x: { env: ["X_API_KEY"] } }
+  const config = { provider: { x: { options: { apiKey: "k" } } } }
+  const r = resolveVisionApiKey("x", catalog, config, {}, {})
+  assert.equal(r.ok, true)
+  if (r.ok) {
+    assert.equal(r.value, "k")
+    assert.equal(r.source, "config")
+  }
+})
+
+test("resolveVisionApiKey: auth.json entry wins over config apiKey", () => {
+  const catalog = { x: { env: ["X_API_KEY"] } }
+  const config = { provider: { x: { options: { apiKey: "config-key" } } } }
+  const auth = { x: { type: "api", key: "a" } }
+  const r = resolveVisionApiKey("x", catalog, config, auth, {})
+  assert.equal(r.ok, true)
+  if (r.ok) {
+    assert.equal(r.value, "a")
+    assert.equal(r.source, "auth")
+  }
+})
+
+test("resolveVisionApiKey: provider id matched case-insensitively in config", () => {
+  const catalog = { "my-prov": { env: ["MY_PROV_API_KEY"] } }
+  // foldMatch lowercases both sides (no separator folding), so the case-only
+  // difference is what the spec's "matched case-insensitively" guarantees.
+  const config = { provider: { "My-PROV": { options: { apiKey: "folded-key" } } } }
+  const r = resolveVisionApiKey("my-prov", catalog, config, {}, {})
+  assert.equal(r.ok, true)
+  if (r.ok) {
+    assert.equal(r.value, "folded-key")
+    assert.equal(r.source, "config")
+  }
+})
+
+test("resolveVisionApiKey: legacy providers section also supplies the key", () => {
+  const catalog = { x: { env: ["X_API_KEY"] } }
+  const config = { providers: { x: { options: { apiKey: "legacy-key" } } } }
+  const r = resolveVisionApiKey("x", catalog, config, {}, {})
+  assert.equal(r.ok, true)
+  if (r.ok) {
+    assert.equal(r.value, "legacy-key")
+    assert.equal(r.source, "config")
+  }
+})
+
+test("resolveVisionApiKey: non-Zen provider with no key anywhere errors with fix hint", () => {
+  const catalog = { "minimax-cn-coding-plan": { env: ["MINIMAX_API_KEY"] } }
+  const r = resolveVisionApiKey("minimax-cn-coding-plan", catalog, {}, {}, {})
+  assert.equal(r.ok, false)
+  if (!r.ok) {
+    assert.match(r.error, /minimax-cn-coding-plan/)
+    assert.match(r.error, /provider\.minimax-cn-coding-plan\.options\.apiKey/)
+    assert.match(r.error, /opencode auth login/)
+  }
+})
+
 test("buildVisionRequest: omits auth headers without a key, keeps them with one", () => {
   const keyless = buildVisionRequest("space-bunny-free", "https://opencode.ai/zen/v1", images, "q", "{}")
   assert.equal(keyless.url, "https://opencode.ai/zen/v1/chat/completions")
