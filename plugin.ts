@@ -93,10 +93,20 @@ type ModelsCatalog = Record<string, RawProvider>
 let registeredModels = new Map<string, VisionModelEntry>()
 // Folded (toLowerCase) "provider/model" keys of registered vision models;
 // agent-name -> vision-capable map; top-level default capability. Populated
-// in the config hook and read by the messages/system transforms.
-let visionModelKeys = new Set<string>()
-let agentVisionCapable = new Map<string, boolean>()
-let defaultVisionCapable = false
+// in the config hook and read by the messages/system transforms. The state
+// lives in a parameterizable object so the v2 setup path can run the SAME
+// RV-1/RV-2 resolution helpers over its own instance (RB-2: the two entries
+// share no mutable state) — v1 populates `v1Capability` in its config hook.
+type VisionCapabilityState = {
+  keys: Set<string>
+  agents: Map<string, boolean>
+  default: boolean
+}
+const v1Capability: VisionCapabilityState = {
+  keys: new Set<string>(),
+  agents: new Map<string, boolean>(),
+  default: false,
+}
 const IMAGE_TMP_DIR = join(tmpdir(), "opencode-vision-delegate")
 
 const PERMISSION = {
@@ -397,11 +407,14 @@ function configuredModelVisionCapable(
 // (2) message info.agent vs agentVisionCapable; (3) defaultVisionCapable.
 // UserMessage.model.modelID is the inline message type's field (NOT the Model
 // type, which uses `id`).
-function userMessageVisionCapable(info: {
-  role: string
-  agent?: string
-  model?: { providerID?: string; modelID?: string }
-}): boolean {
+function userMessageVisionCapable(
+  info: {
+    role: string
+    agent?: string
+    model?: { providerID?: string; modelID?: string }
+  },
+  state: VisionCapabilityState = v1Capability,
+): boolean {
   const m = info.model
   if (
     m &&
@@ -409,12 +422,27 @@ function userMessageVisionCapable(info: {
     typeof m.modelID === "string" &&
     (m.providerID !== "" || m.modelID !== "")
   ) {
-    return visionModelKeys.has(`${m.providerID}/${m.modelID}`.toLowerCase())
+    return state.keys.has(`${m.providerID}/${m.modelID}`.toLowerCase())
   }
-  if (typeof info.agent === "string" && agentVisionCapable.has(info.agent)) {
-    return Boolean(agentVisionCapable.get(info.agent))
+  if (typeof info.agent === "string" && state.agents.has(info.agent)) {
+    return Boolean(state.agents.get(info.agent))
   }
-  return defaultVisionCapable
+  return state.default
+}
+
+// Request-level capability check (the system transform's input.model is the
+// Model shape with providerID + id). Reuses the folded key set of the given
+// capability state — same lookup as userMessageVisionCapable above.
+function requestModelVisionCapable(
+  model: { providerID?: unknown; id?: unknown } | undefined,
+  state: VisionCapabilityState = v1Capability,
+): boolean {
+  return Boolean(
+    model &&
+      typeof model.providerID === "string" &&
+      typeof model.id === "string" &&
+      state.keys.has(`${model.providerID}/${model.id}`.toLowerCase()),
+  )
 }
 
 function saveImagePart(
@@ -459,25 +487,225 @@ function mimeToExt(mime: string): string {
   return "png"
 }
 
-// The native vision_analyze tool. execute runs in-process: model configured
-// (from agent["vision-agent"].model) -> endpoint + key resolution -> read
-// images -> OpenAI-compatible or Anthropic-shaped chat completion (shape
-// resolved from the endpoint URL, see src/vision-http.ts) -> return the
-// model's raw JSON text. Error categories are encoded in the message prefix
-// so the skill can branch: "model not configured" (never falls back),
+// Source D rewrite (RV-1): materialize user-dropped images as stable paths
+// that the orchestrator can pass to the vision_analyze tool (or the
+// vision-agent subagent fallback). Host-agnostic — called by the v1
+// messages transform and the v2 session context hook with their own
+// capability state instances.
+function rewriteDroppedImages(
+  messages: unknown[],
+  state: VisionCapabilityState = v1Capability,
+): void {
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue
+    const message = m as {
+      info?: { role?: string }
+      parts?: unknown[]
+    }
+    if (message.info?.role !== "user") continue
+    // A vision-capable user message keeps image parts untouched (native
+    // path). The rewrite loop below then runs only for text-only messages.
+    if (userMessageVisionCapable(message.info as Parameters<typeof userMessageVisionCapable>[0], state)) continue
+    for (const p of message.parts ?? []) {
+      if (!p || typeof p !== "object") continue
+      const part = p as {
+        type?: string
+        mime?: string
+        url?: string
+        id?: string
+        filename?: string
+      }
+      if (part.type !== "file") continue
+      if (!part.mime) continue
+      if (!isImageMime(part.mime)) continue
+      const originalFilename = part.filename ?? "image"
+      let text: string
+      try {
+        const path = saveImagePart(
+          part.url ?? "",
+          (message.info as { sessionID?: string }).sessionID ?? "unknown-session",
+          part.id ?? "unknown-part",
+          mimeToExt(part.mime),
+        )
+        text = `[vision:dropped-image] ${JSON.stringify({
+          mime: part.mime,
+          path,
+          originalFilename,
+        })}`
+      } catch (error) {
+        text = `[vision:dropped-image-error] ${JSON.stringify({
+          mime: part.mime,
+          originalFilename,
+          error: error instanceof Error ? error.message : String(error),
+        })}`
+      }
+      ;(part as any).type = "text"
+      ;(part as any).text = text
+      ;(part as any).synthetic = true
+    }
+  }
+}
+
+// The [vision:native] system instruction (RV-2): injected only for
+// vision-capable handling models; shared verbatim by the v1 system transform
+// and the v2 session context hook.
+const NATIVE_INSTRUCTION =
+  "[vision:native] You receive image parts natively in this session. " +
+  "Inspect images directly from the message. Do NOT use the vision skill for plain reading " +
+  "and do NOT delegate visual tasks to a vision-* subagent. Exception: when small text or " +
+  "fine detail is beyond native resolution, you MAY call vision_analyze WITH a `region` " +
+  "argument to zoom into that area of an image FILE on disk."
+
+// Host-agnostic vision_analyze execute core (change v2-plugin-api-port task
+// 1.1): file reading, region crop, endpoint + key resolution, HTTP, parsing.
+// Called by the v1 `tool()` wrapper (knobs snapshotted from the config-hook
+// module state) and by the v2 `ctx.tool.transform` registration (knobs from
+// the vision-agent agent record). Error categories are encoded in the message
+// prefix so the skill can branch: "model not configured" (never falls back),
 // "provider error" (falls back to the vision-agent subagent), "invalid
-// response" (skill Step 6 retry).
+// response" (skill Step 6 retry), "crop error" / "missing image" (no request).
+const VISION_TOOL_DESCRIPTION =
+  "Performs a visual judgment on local image files with the configured vision model. " +
+  "Pass `images` as [{id, path, region?}] (short contract ids plus local image paths), the exact visual " +
+  "`question`, a `response_template` (JSON string defining the required response shape), and " +
+  "optional `response_rules` for task-specific constraints. Returns exactly one JSON object " +
+  "matching the response template. Optional per-image `region: [x1, y1, x2, y2]` (integer pixel " +
+  "coordinates in the ORIGINAL image, x2/y2 exclusive, PNG only) crops that region in memory at " +
+  "full resolution — load the full image first, then re-call with a region to zoom into small " +
+  "text or fine detail."
+
+type VisionAnalyzeArgs = {
+  images: { id: string; path: string; region?: number[] }[]
+  question: string
+  response_template: string
+  response_rules?: string
+}
+
+type VisionAnalyzeCtx = { directory?: string; abort?: AbortSignal }
+
+// Everything execute needs beyond args: knob snapshot (model/disable/
+// temperature/extraBody — the plugin never WRITES these, only reads) plus the
+// config/catalog pair used for capability and endpoint/key resolution.
+type VisionToolKnobs = {
+  disabled: boolean
+  model: string | undefined
+  temperature: number | undefined
+  extraBody: Record<string, unknown> | undefined
+  config: ConfigLike
+  catalog: ModelsCatalog
+}
+
+function v1VisionToolKnobs(): VisionToolKnobs {
+  return {
+    disabled: visionToolDisabled,
+    model: visionToolModel,
+    temperature: visionToolTemperature,
+    extraBody: visionToolExtraBody,
+    config: visionToolConfig,
+    catalog: visionToolCatalog,
+  }
+}
+
+async function runVisionAnalyze(
+  args: VisionAnalyzeArgs,
+  ctx: VisionAnalyzeCtx,
+  knobs: VisionToolKnobs,
+): Promise<string> {
+  if (knobs.disabled) {
+    throw new Error(
+      'vision_analyze: vision-agent is disabled: set disable: false on agent["vision-agent"] to use this tool',
+    )
+  }
+  if (!knobs.model) {
+    throw new Error(
+      'vision_analyze: model not configured: set agent["vision-agent"].model to a vision-capable ' +
+        'provider/model (e.g. "minimax-cn-coding-plan/MiniMax-M3")',
+    )
+  }
+  const parts = splitModel(knobs.model)
+  if (!parts) {
+    throw new Error(
+      `vision_analyze: model not configured: invalid model id "${knobs.model}" (expected "provider/model")`,
+    )
+  }
+  const models = providerModels(parts.provider, knobs.catalog, knobs.config)
+  const match = models[foldKey(models, parts.modelID)]
+  if (!match || !isVisionModel(match)) {
+    throw new Error(
+      `vision_analyze: model not configured: ${knobs.model} is not image-capable; set ` +
+        'agent["vision-agent"].model to a vision-capable model',
+    )
+  }
+  const endpoint = resolveVisionEndpoint(parts.provider, knobs.catalog, knobs.config, process.env)
+  if (!endpoint.ok) throw new Error(`vision_analyze: provider error: ${endpoint.error}`)
+  const apiKey = resolveVisionApiKey(
+    parts.provider,
+    knobs.catalog,
+    knobs.config,
+    readAuthData(),
+    process.env,
+  )
+  if (!apiKey.ok) throw new Error(`vision_analyze: provider error: ${apiKey.error}`)
+  const images: { id: string; path: string; base64: string; mime?: string }[] = []
+  const disclosures: string[] = []
+  for (const image of args.images) {
+    const path = isAbsolute(image.path)
+      ? image.path
+      : typeof ctx.directory === "string"
+        ? join(ctx.directory, image.path)
+        : image.path
+    if (!existsSync(path)) {
+      throw new Error(`vision_analyze: missing image: ${path}`)
+    }
+    // Region crop (VT-8) runs inside the existing read loop — error
+    // precedence (disabled -> model not configured -> provider error ->
+    // missing image -> crop error) is unchanged for region-free calls.
+    let prepared
+    try {
+      prepared = prepareVisionImage({ id: image.id, path, region: image.region })
+    } catch (error) {
+      if (error instanceof VisionCropError) {
+        throw new Error(`vision_analyze: crop error: ${error.message}`)
+      }
+      throw error
+    }
+    if (prepared.disclosure) disclosures.push(prepared.disclosure)
+    images.push({
+      id: prepared.id,
+      path: prepared.path,
+      base64: prepared.base64,
+      ...(prepared.mime ? { mime: prepared.mime } : {}),
+    })
+  }
+  // Coordinate disclosure rides the prompt (VT-8): cropped images come
+  // back with coordinates already in original-image space; the tool's
+  // response contract stays exactly one template-matching JSON object.
+  const question = disclosures.length
+    ? `${args.question}\n\nRegion crop coordinate mapping:\n${disclosures.join("\n")}`
+    : args.question
+  const request = buildVisionRequest(
+    parts.modelID,
+    endpoint.value,
+    images,
+    question,
+    args.response_template,
+    args.response_rules,
+    apiKey.value,
+    { temperature: knobs.temperature, extraBody: knobs.extraBody },
+  )
+  const result = await postVisionRequest(request, {
+    signal: ctx.abort,
+    timeoutMs: resolveVisionToolTimeoutMs(),
+  })
+  if (!result.ok) throw new Error(`vision_analyze: provider error: ${result.error}`)
+  const parsed = parseVisionResponse(result.text)
+  if (!parsed.ok) throw new Error(`vision_analyze: invalid response: ${parsed.error}`)
+  return parsed.text
+}
+
 function visionAnalyzeTool() {
   return tool({
-    description:
-      "Performs a visual judgment on local image files with the configured vision model. " +
-      "Pass `images` as [{id, path, region?}] (short contract ids plus local image paths), the exact visual " +
-      "`question`, a `response_template` (JSON string defining the required response shape), and " +
-      "optional `response_rules` for task-specific constraints. Returns exactly one JSON object " +
-      "matching the response template. Optional per-image `region: [x1, y1, x2, y2]` (integer pixel " +
-      "coordinates in the ORIGINAL image, x2/y2 exclusive, PNG only) crops that region in memory at " +
-      "full resolution — load the full image first, then re-call with a region to zoom into small " +
-      "text or fine detail.",
+    description: VISION_TOOL_DESCRIPTION,
     args: {
       images: tool.schema.array(
         tool.schema.object({
@@ -493,92 +721,7 @@ function visionAnalyzeTool() {
       response_rules: tool.schema.optional(tool.schema.string()),
     },
     async execute(args, ctx) {
-      if (visionToolDisabled) {
-        throw new Error(
-          'vision_analyze: vision-agent is disabled: set disable: false on agent["vision-agent"] to use this tool',
-        )
-      }
-      if (!visionToolModel) {
-        throw new Error(
-          'vision_analyze: model not configured: set agent["vision-agent"].model to a vision-capable ' +
-            'provider/model (e.g. "minimax-cn-coding-plan/MiniMax-M3")',
-        )
-      }
-      const parts = splitModel(visionToolModel)
-      if (!parts) {
-        throw new Error(
-          `vision_analyze: model not configured: invalid model id "${visionToolModel}" (expected "provider/model")`,
-        )
-      }
-      const models = providerModels(parts.provider, visionToolCatalog, visionToolConfig)
-      const match = models[foldKey(models, parts.modelID)]
-      if (!match || !isVisionModel(match)) {
-        throw new Error(
-          `vision_analyze: model not configured: ${visionToolModel} is not image-capable; set ` +
-            'agent["vision-agent"].model to a vision-capable model',
-        )
-      }
-      const endpoint = resolveVisionEndpoint(parts.provider, visionToolCatalog, visionToolConfig, process.env)
-      if (!endpoint.ok) throw new Error(`vision_analyze: provider error: ${endpoint.error}`)
-      const apiKey = resolveVisionApiKey(
-        parts.provider,
-        visionToolCatalog,
-        visionToolConfig,
-        readAuthData(),
-        process.env,
-      )
-      if (!apiKey.ok) throw new Error(`vision_analyze: provider error: ${apiKey.error}`)
-      const images: { id: string; path: string; base64: string; mime?: string }[] = []
-      const disclosures: string[] = []
-      for (const image of args.images) {
-        const path = isAbsolute(image.path) ? image.path : join(ctx.directory, image.path)
-        if (!existsSync(path)) {
-          throw new Error(`vision_analyze: missing image: ${path}`)
-        }
-        // Region crop (VT-8) runs inside the existing read loop — error
-        // precedence (disabled -> model not configured -> provider error ->
-        // missing image -> crop error) is unchanged for region-free calls.
-        let prepared
-        try {
-          prepared = prepareVisionImage({ id: image.id, path, region: image.region })
-        } catch (error) {
-          if (error instanceof VisionCropError) {
-            throw new Error(`vision_analyze: crop error: ${error.message}`)
-          }
-          throw error
-        }
-        if (prepared.disclosure) disclosures.push(prepared.disclosure)
-        images.push({
-          id: prepared.id,
-          path: prepared.path,
-          base64: prepared.base64,
-          ...(prepared.mime ? { mime: prepared.mime } : {}),
-        })
-      }
-      // Coordinate disclosure rides the prompt (VT-8): cropped images come
-      // back with coordinates already in original-image space; the tool's
-      // response contract stays exactly one template-matching JSON object.
-      const question = disclosures.length
-        ? `${args.question}\n\nRegion crop coordinate mapping:\n${disclosures.join("\n")}`
-        : args.question
-      const request = buildVisionRequest(
-        parts.modelID,
-        endpoint.value,
-        images,
-        question,
-        args.response_template,
-        args.response_rules,
-        apiKey.value,
-        { temperature: visionToolTemperature, extraBody: visionToolExtraBody },
-      )
-      const result = await postVisionRequest(request, {
-        signal: ctx.abort,
-        timeoutMs: resolveVisionToolTimeoutMs(),
-      })
-      if (!result.ok) throw new Error(`vision_analyze: provider error: ${result.error}`)
-      const parsed = parseVisionResponse(result.text)
-      if (!parsed.ok) throw new Error(`vision_analyze: invalid response: ${parsed.error}`)
-      return parsed.text
+      return runVisionAnalyze(args, ctx, v1VisionToolKnobs())
     },
   })
 }
@@ -598,15 +741,15 @@ const plugin: Plugin = async () => ({
   // vision-agent registration so user-configured agents are included (the
   // subagent's own messages carry a vision info.model that wins first in
   // the transform).
-  visionModelKeys = buildVisionModelKeys(catalog, cfg as ConfigLike)
-  defaultVisionCapable = configuredModelVisionCapable(cfg.model, catalog, cfg as ConfigLike)
-  agentVisionCapable = new Map()
+  v1Capability.keys = buildVisionModelKeys(catalog, cfg as ConfigLike)
+  v1Capability.default = configuredModelVisionCapable(cfg.model, catalog, cfg as ConfigLike)
+  v1Capability.agents = new Map()
   const agentsSection = (cfg as ConfigLike & {
     agent?: Record<string, { model?: string } | undefined>
   }).agent ?? {}
   for (const [name, entry] of Object.entries(agentsSection)) {
     if (entry && typeof entry.model === "string") {
-      agentVisionCapable.set(
+      v1Capability.agents.set(
         name,
         configuredModelVisionCapable(entry.model, catalog, cfg as ConfigLike),
       )
@@ -704,43 +847,9 @@ const plugin: Plugin = async () => ({
 
   // Source D: materialize user-dropped images as stable paths that the
   // orchestrator can pass to the vision_analyze tool (or the vision-agent
-  // subagent fallback).
+  // subagent fallback). Delegates to the shared RV-1 rewrite helper.
   "experimental.chat.messages.transform": async (_input, output) => {
-    for (const m of output.messages) {
-      if (m.info.role !== "user") continue
-      // A vision-capable user message keeps image parts untouched (native
-      // path). The rewrite loop below then runs only for text-only messages.
-      if (userMessageVisionCapable(m.info)) continue
-      for (const part of m.parts) {
-        if (part.type !== "file") continue
-        if (!part.mime) continue
-        if (!isImageMime(part.mime)) continue
-        const originalFilename = part.filename ?? "image"
-        let text: string
-        try {
-          const path = saveImagePart(
-            part.url,
-            m.info.sessionID,
-            part.id,
-            mimeToExt(part.mime),
-          )
-          text = `[vision:dropped-image] ${JSON.stringify({
-            mime: part.mime,
-            path,
-            originalFilename,
-          })}`
-        } catch (error) {
-          text = `[vision:dropped-image-error] ${JSON.stringify({
-            mime: part.mime,
-            originalFilename,
-            error: error instanceof Error ? error.message : String(error),
-          })}`
-        }
-        ;(part as any).type = "text"
-        ;(part as any).text = text
-        ;(part as any).synthetic = true
-      }
-    }
+    rewriteDroppedImages(output.messages, v1Capability)
   },
 
   // The system transform tells the orchestrator how images are routed in
@@ -750,23 +859,10 @@ const plugin: Plugin = async () => ({
   // The model is configured by the user via the opencode agent model
   // override on vision-agent. No model script or picker is involved.
   "experimental.chat.system.transform": async (input, output) => {
-    // input.model is Model (has providerID + id, NOT modelID). Reuse the
-    // folded visionModelKeys lookup.
-    const model = input.model
-    const capable = Boolean(
-      model &&
-        typeof model.providerID === "string" &&
-        typeof model.id === "string" &&
-        visionModelKeys.has(`${model.providerID}/${model.id}`.toLowerCase()),
-    )
-    if (capable) {
-      output.system.push(
-        "[vision:native] You receive image parts natively in this session. " +
-          "Inspect images directly from the message. Do NOT use the vision skill for plain reading " +
-          "and do NOT delegate visual tasks to a vision-* subagent. Exception: when small text or " +
-          "fine detail is beyond native resolution, you MAY call vision_analyze WITH a `region` " +
-          "argument to zoom into that area of an image FILE on disk.",
-      )
+    // input.model is Model (has providerID + id, NOT modelID). Reuses the
+    // folded key set lookup (shared with the v2 context hook).
+    if (requestModelVisionCapable(input.model, v1Capability)) {
+      output.system.push(NATIVE_INSTRUCTION)
       return
     }
     // Text-only path: inject nothing. The vision skill (SKILL.md) instructs
@@ -777,19 +873,19 @@ const plugin: Plugin = async () => ({
 })
 
 // ---------------------------------------------------------------------------
-// v2 plugin entry (forward compatibility).
+// v2 plugin entry (full V2 parity per change v2-plugin-api-port).
 //
 // opencode's v2 plugin architecture loads `setup(ctx)` from the same default
 // export (the v1 loader only reads `server` and ignores `setup`; the v2
-// loader only reads `setup` and ignores `server`). As of opencode 1.18 the v2
-// PluginContext has agent/skill/... domains but NO tool registration and NO
-// chat message/system transforms, so the v2 path can only carry the
-// vision-agent subagent + vision skill — the vision_analyze tool, image
-// materialization, and native-vision gating remain v1-only until upstream
-// adds them. The npm install (`opencode plugin`, which writes the v1
-// `plugin` config array) loads the v1 entry, so the shipped experience is
-// full-featured; this setup() keeps the package loadable and useful the day
-// a v2 host becomes the default.
+// loader only reads `setup` and ignores `server`). The v2 PluginContext now
+// exposes every domain the v1 feature set needs — ctx.tool.transform (the
+// vision_analyze tool), ctx.permission.hook("evaluate") (VT-3 auto-allow),
+// ctx.session.hook("context") (RV-1/RV-2 routing), ctx.agent / ctx.skill
+// (the subagent + skill registrations). The shared cores (runVisionAnalyze,
+// rewriteDroppedImages, requestModelVisionCapable) are extracted above and
+// reused by both entries, so V2 parity is wiring, not a second
+// implementation. The two entries keep disjoint registration targets and
+// share no mutable state (RB-2).
 //
 // Typed structurally (no import from `@opencode-ai/plugin/v2/*`): the stable
 // 1.18 package does not ship v2 types, and the v2 surface is still moving.
@@ -803,19 +899,324 @@ type V2AgentDraft = {
   remove(id: string): void
 }
 type V2SkillDraft = {
-  source(source: { type: "directory"; path: string }): void
+  source?(source: { type: "directory"; path: string }): void
+  add?(skill: {
+    id: string
+    name: string
+    description?: string
+    path: string
+    content: string
+  }): void
   list(): unknown[]
+}
+type V2ToolEditor = {
+  add?(definition: {
+    name: string
+    description: string
+    input: Record<string, unknown>
+    execute: (args: unknown, ctx: unknown) => Promise<unknown>
+  }): unknown
 }
 type V2PluginContext = {
   agent?: {
-    transform(cb: (draft: V2AgentDraft) => void | Promise<void>): Promise<unknown>
+    transform?(cb: (draft: V2AgentDraft) => void | Promise<void>): Promise<unknown>
   }
   skill?: {
-    transform(cb: (draft: V2SkillDraft) => void | Promise<void>): Promise<unknown>
+    transform?(cb: (draft: V2SkillDraft) => void | Promise<void>): Promise<unknown>
+  }
+  tool?: {
+    transform?(cb: (editor: V2ToolEditor) => void | Promise<void>): Promise<unknown>
+  }
+  permission?: {
+    hook?(name: "evaluate", cb: (event: unknown) => void | Promise<void>): unknown
+  }
+  session?: {
+    hook?(name: "context", cb: (event: unknown) => void | Promise<void>): unknown
+  }
+  options?: unknown
+}
+
+// JSON Schema input contract for the v2 tool registration (task 2.1): the
+// literal equivalent of the v1 tool.schema.* chain — images array of
+// {id, path, region?} with region exactly 4 integers, required
+// images/question/response_template, optional response_rules.
+const VISION_ANALYZE_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    images: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          path: { type: "string" },
+          region: {
+            type: "array",
+            items: { type: "integer" },
+            minItems: 4,
+            maxItems: 4,
+          },
+        },
+        required: ["id", "path"],
+      },
+    },
+    question: { type: "string" },
+    response_template: { type: "string" },
+    response_rules: { type: "string" },
+  },
+  required: ["images", "question", "response_template"],
+} as const
+
+// Wrap the shared execute core's result text in the host's structured-content
+// shape. VERIFIED against 2.3.2 (task 3.4): Tool.Result.content is
+// `string | Array<{type:"text",text} | {type:"file",uri,mime,name?}>` — a bare
+// string content is valid and consumed by the host (observed live: a probe
+// tool returning {content:"..."} executed and its result reached the model).
+function wrapV2ToolResult(text: string): { content: string } {
+  return { content: text }
+}
+
+// VERIFIED against 2.3.2 (task 3.4, live observation + @opencode/schema
+// 2.3.2 Agent.Info): the agent-domain record carries `model` as an OBJECT
+// `{ id, providerID }` (a config string "providerID/modelID" under the
+// `agents` map is folded by the host — observed in `debug agents`), request
+// knobs under `request.settings` / `request.body` (config `request.body`
+// propagates verbatim; observed: `thinking` landed in request.body), and the
+// config-level disable flag lives in ConfigAgent.Info (`disabled`) — a
+// disabled config agent is excluded from the domain before plugins see it,
+// so the disable read stays a defensive leg. Legacy flat fields
+// (model as string / temperature / extraBody) are kept as drift fallbacks.
+function readV2AgentKnobs(record: unknown): {
+  model: string | undefined
+  disabled: boolean
+  temperature: number | undefined
+  extraBody: Record<string, unknown> | undefined
+} {
+  const agent = (record ?? {}) as {
+    model?: unknown
+    disable?: unknown
+    disabled?: unknown
+    temperature?: unknown
+    extraBody?: unknown
+    request?: {
+      settings?: { temperature?: unknown }
+      body?: unknown
+    }
+  }
+  // model: object form {id, providerID} folds to "providerID/id"; a plain
+  // string (older/flat shape) passes through.
+  let model: string | undefined
+  const m = agent.model
+  if (typeof m === "string" && m) model = m
+  else if (
+    m &&
+    typeof m === "object" &&
+    typeof (m as { id?: unknown }).id === "string" &&
+    typeof (m as { providerID?: unknown }).providerID === "string"
+  ) {
+    model = `${(m as { providerID: string }).providerID}/${(m as { id: string }).id}`
+  }
+  const temperatureCandidate = agent.request?.settings?.temperature
+  return {
+    model,
+    disabled: agent.disable === true || agent.disabled === true,
+    temperature:
+      typeof temperatureCandidate === "number" && Number.isFinite(temperatureCandidate)
+        ? temperatureCandidate
+        : typeof agent.temperature === "number" && Number.isFinite(agent.temperature)
+          ? agent.temperature
+          : undefined,
+    extraBody:
+      agent.request?.body && typeof agent.request.body === "object" && !Array.isArray(agent.request.body)
+        ? (agent.request.body as Record<string, unknown>)
+        : agent.extraBody && typeof agent.extraBody === "object" && !Array.isArray(agent.extraBody)
+          ? (agent.extraBody as Record<string, unknown>)
+          : undefined,
+  }
+}
+
+// Permission evaluate guard (task 2.2). VERIFIED against 2.3.2 (task 3.4,
+// live capture with an ask rule + a write-tool call): the evaluate event is
+// PermissionEvaluation `{ sessionID, agent?, action, resources[], metadata?,
+// source?: {type:"tool", messageID, id}, effect, message? }` — the tool
+// identity is `action` and the decision is `effect` ("allow" | "deny" |
+// "ask"). Only `ask` is upgraded to `allow`; an explicit `deny` is never
+// touched. The v1-style chain (metadata.tool -> permission -> id -> type) is
+// kept as a drift fallback for other host shapes.
+function v2PermissionEvaluate(event: unknown): void {
+  try {
+    const e = (event ?? {}) as {
+      action?: unknown
+      metadata?: { tool?: unknown }
+      permission?: unknown
+      id?: unknown
+      type?: unknown
+      effect?: unknown
+      decision?: { status?: unknown }
+      status?: unknown
+    }
+    const name =
+      (typeof e.action === "string" ? e.action : undefined) ??
+      (typeof e.metadata?.tool === "string" ? e.metadata.tool : undefined) ??
+      (typeof e.permission === "string" ? e.permission : undefined) ??
+      (typeof e.id === "string" ? e.id : undefined) ??
+      (typeof e.type === "string" ? e.type : undefined)
+    if (name !== VISION_TOOL_NAME) return
+    if (e.effect === "ask") e.effect = "allow"
+    else if (e.decision && typeof e.decision === "object") {
+      if (e.decision.status === "ask") e.decision.status = "allow"
+    } else if (e.status === "ask") {
+      e.status = "allow"
+    }
+  } catch {
+    // Host-shape drift degrades to a no-op, never throws.
+  }
+}
+
+// V2 media-part rewrite (RV-1 on v2). VERIFIED against 2.3.2 (task 3.4, live
+// capture with an attached image): context-event messages are
+// `{ id, role, content: parts[] }` (NOT the v1 `{info, parts}` shape) and an
+// image part is `{ type:"media", media:{ source:{ type:"base64", data,
+// mediaType } }, filename? }` (NOT v1's `{type:"file", mime, url}`). The
+// per-request capability comes from event.model ({id, providerID} — verified
+// matching requestModelVisionCapable); v2 messages carry no per-message
+// model, so the request model decides for every user message. Materializes
+// base64 image parts to the plugin temp dir and replaces them with the same
+// [vision:dropped-image] marker JSON as v1.
+function rewriteDroppedImagesV2(
+  messages: unknown[],
+  capable: boolean,
+  sessionID: string,
+): void {
+  if (capable) return
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue
+    const message = m as { role?: unknown; content?: unknown; id?: unknown }
+    if (message.role !== "user") continue
+    if (!Array.isArray(message.content)) continue
+    for (const p of message.content) {
+      if (!p || typeof p !== "object") continue
+      const part = p as {
+        type?: unknown
+        media?: {
+          source?: { type?: unknown; data?: unknown; mediaType?: unknown; url?: unknown }
+          mediaType?: unknown
+        }
+        filename?: unknown
+      }
+      if (part.type !== "media" || !part.media?.source) continue
+      const mediaType =
+        typeof part.media.source.mediaType === "string"
+          ? part.media.source.mediaType
+          : typeof part.media.mediaType === "string"
+            ? part.media.mediaType
+            : ""
+      if (!isImageMime(mediaType)) continue
+      const originalFilename = typeof part.filename === "string" ? part.filename : "image"
+      // Base64 inline payload (verified shape) or a plain URL fallback.
+      const payload =
+        part.media.source.type === "base64" && typeof part.media.source.data === "string"
+          ? `data:${mediaType};base64,${part.media.source.data}`
+          : typeof part.media.source.url === "string"
+            ? part.media.source.url
+            : ""
+      let text: string
+      try {
+        const path = saveImagePart(
+          payload,
+          sessionID,
+          `${message.id ?? "msg"}-${originalFilename}-${message.content.indexOf(p)}`,
+          mimeToExt(mediaType),
+        )
+        text = `[vision:dropped-image] ${JSON.stringify({
+          mime: mediaType,
+          path,
+          originalFilename,
+        })}`
+      } catch (error) {
+        text = `[vision:dropped-image-error] ${JSON.stringify({
+          mime: mediaType,
+          originalFilename,
+          error: error instanceof Error ? error.message : String(error),
+        })}`
+      }
+      const mutable = part as Record<string, unknown>
+      mutable.type = "text"
+      mutable.text = text
+      delete mutable.media
+    }
+  }
+}
+
+// Session context hook (task 2.3): the RV-1/RV-2 routing seam on v2. Edits
+// event.system (the [vision:native] instruction for vision-capable handling
+// models) and event.messages (image materialization + marker rewrite for
+// text-only models), reusing the same resolution helpers as the v1
+// transforms with the v2 entry's own capability state. Any drift (missing
+// arrays, alien shapes) degrades to pass-through.
+// VERIFIED against 2.3.2 (task 3.4): event.model is `{ id, providerID }`
+// (matches requestModelVisionCapable), event.system is an array of
+// `{type:"text", text}` OBJECTS (a bare string push would corrupt it — the
+// object form is used, with a string-form drift leg), and event.messages use
+// the {id, role, content} shape handled by rewriteDroppedImagesV2.
+function v2SessionContext(event: unknown, state: VisionCapabilityState): void {
+  try {
+    const e = (event ?? {}) as {
+      system?: unknown
+      messages?: unknown
+      model?: { providerID?: unknown; id?: unknown }
+      sessionID?: unknown
+    }
+    const capable = requestModelVisionCapable(e.model, state)
+    if (Array.isArray(e.system) && capable) {
+      // Observed shape: array of {type:"text", text} objects. If the array
+      // holds bare strings (host drift), keep the string form.
+      if (e.system.length === 0 || typeof e.system[0] === "object") {
+        ;(e.system as unknown[]).push({ type: "text", text: NATIVE_INSTRUCTION })
+      } else {
+        ;(e.system as unknown[]).push(NATIVE_INSTRUCTION)
+      }
+    }
+    if (Array.isArray(e.messages)) {
+      rewriteDroppedImagesV2(
+        e.messages as unknown[],
+        capable,
+        typeof e.sessionID === "string" ? e.sessionID : "unknown-session",
+      )
+    }
+  } catch {
+    // Host-shape drift degrades to pass-through, never throws.
   }
 }
 
 async function v2Setup(ctx: V2PluginContext): Promise<void> {
+  // Knob + capability sources. V2 has no mutable global config object, so
+  // the tool knobs resolve from the vision-agent agent record via the agent
+  // domain (design decision 3) and capability resolution uses the cached
+  // models catalog plus ctx.options as the config stand-in.
+  // VERIFIED against 2.3.2 (task 3.4): ctx.options was observed as an EMPTY
+  // object even with a populated opencode.json — it is not the user config.
+  // Endpoint/key resolution therefore falls through to provider env vars and
+  // the models catalog (the same priority chain, minus the config leg).
+  const catalog = readModelsCatalog()
+  const optionsConfig =
+    ctx.options && typeof ctx.options === "object"
+      ? (ctx.options as ConfigLike)
+      : {}
+  const v2Capability: VisionCapabilityState = {
+    keys: buildVisionModelKeys(catalog, optionsConfig),
+    agents: new Map<string, boolean>(),
+    default: configuredModelVisionCapable(optionsConfig.model, catalog, optionsConfig),
+  }
+  let v2Knobs: VisionToolKnobs = {
+    disabled: false,
+    model: undefined,
+    temperature: undefined,
+    extraBody: undefined,
+    config: optionsConfig,
+    catalog,
+  }
+
   // Same registration contract as the v1 config hook: register the
   // vision-agent subagent only when absent (the user's own config and the
   // core's config-agent plugin own it once it exists) and never write
@@ -823,6 +1224,36 @@ async function v2Setup(ctx: V2PluginContext): Promise<void> {
   // `prompt`), `mode`, `hidden`, `permissions`.
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform(async (draft) => {
+      // Knob capture (task 2.4): read-only snapshot of the user's
+      // vision-agent record — the plugin never writes these fields. Runs
+      // whether or not the create-only registration below fires, so an
+      // existing user record still supplies the tool's model.
+      if (typeof draft.get === "function") {
+        const record = draft.get("vision-agent")
+        if (record !== undefined) {
+          const knobs = readV2AgentKnobs(record)
+          v2Knobs = {
+            ...knobs,
+            config: optionsConfig,
+            catalog,
+          }
+        }
+      }
+      // Agent-name -> capability map for message routing (RV-1 order step 2):
+      // read each draft record's model if the host exposes list().
+      if (typeof draft.list === "function") {
+        for (const entry of draft.list() ?? []) {
+          if (!entry || typeof entry.id !== "string") continue
+          const record = typeof draft.get === "function" ? draft.get(entry.id) : undefined
+          const model = (record as { model?: unknown } | undefined)?.model
+          if (typeof model === "string") {
+            v2Capability.agents.set(
+              entry.id,
+              configuredModelVisionCapable(model, catalog, optionsConfig),
+            )
+          }
+        }
+      }
       if (typeof draft.get !== "function" || typeof draft.update !== "function") return
       if (draft.get("vision-agent") !== undefined) return
       draft.update("vision-agent", (agent) => {
@@ -833,13 +1264,66 @@ async function v2Setup(ctx: V2PluginContext): Promise<void> {
       })
     })
   }
-  // Expose the bundled skill directory as a v2 skill source. Directory
-  // sources are scanned for SKILL.md, same as the v1 skills.paths entry.
+  // Expose the bundled skill as a v2 skill registration. VERIFIED against
+  // 2.3.2 (task 3.4): SkillEditor has list/get/add/update/remove — there is
+  // NO `source` method (the assumed directory-source call is a silent no-op
+  // there, kept guarded for hosts that do expose it). The 2.3.2 path embeds
+  // the bundled SKILL.md via draft.add(Skill.Info) — the exact shape the
+  // skill list serves (`{id, name, description?, path, content}`).
   if (typeof ctx.skill?.transform === "function") {
     await ctx.skill.transform(async (draft) => {
-      if (typeof draft.source !== "function") return
-      draft.source({ type: "directory", path: dataDir })
+      if (typeof draft.source === "function") {
+        draft.source({ type: "directory", path: dataDir })
+        return
+      }
+      if (typeof draft.add !== "function") return
+      const skillPath = join(dataDir, "SKILL.md")
+      try {
+        const content = readFileSync(skillPath, "utf8")
+        draft.add({
+          id: "vision",
+          name: "vision",
+          description:
+            "Visual intent detection and delegation routing (vision_analyze tool first, vision-agent subagent fallback) for text-only models.",
+          path: skillPath,
+          content,
+        })
+      } catch {
+        // No bundled SKILL.md (single-file install) — degrade to no-op.
+      }
     })
+  }
+  // Register vision_analyze via ctx.tool.transform (task 2.1): same shared
+  // execute core and error-category prefixes as the v1 tool; the JSON Schema
+  // input mirrors the v1 tool.schema chain. A disabled vision-agent record
+  // suppresses the registration entirely (VT-2/RV-6).
+  if (!v2Knobs.disabled && typeof ctx.tool?.transform === "function") {
+    await ctx.tool.transform(async (editor) => {
+      if (typeof editor?.add !== "function") return
+      editor.add({
+        name: VISION_TOOL_NAME,
+        description: VISION_TOOL_DESCRIPTION,
+        input: VISION_ANALYZE_INPUT_SCHEMA as unknown as Record<string, unknown>,
+        async execute(args: unknown, toolCtx: unknown) {
+          const text = await runVisionAnalyze(
+            args as VisionAnalyzeArgs,
+            (toolCtx ?? {}) as VisionAnalyzeCtx,
+            v2Knobs,
+          )
+          return wrapV2ToolResult(text)
+        },
+      })
+    })
+  }
+  // Auto-allow vision_analyze permission requests (task 2.2): upgrade ask ->
+  // allow for this tool only; explicit deny wins (VT-3).
+  if (typeof ctx.permission?.hook === "function") {
+    ctx.permission.hook("evaluate", (event) => v2PermissionEvaluate(event))
+  }
+  // RV-1/RV-2 routing seam (task 2.3): system instruction + image
+  // materialization via one context hook.
+  if (typeof ctx.session?.hook === "function") {
+    ctx.session.hook("context", (event) => v2SessionContext(event, v2Capability))
   }
 }
 

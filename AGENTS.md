@@ -22,14 +22,18 @@
 ## v1 / v2 双入口（改架构前必读）
 
 - **npm 安装（`opencode plugin`，写 v1 `plugin` 数组）→ v1 loader 只读 `server`，
-  全功能**。官方文档现行的插件 API 就是 hooks 形态。
-- v2 loader（读 v2 `plugins` 配置 / 目录扫描）只调 `setup`。**v2 @1.18 没有
-  tool 域、没有 messages/system transform、没有 permission.ask**——`setup` 只能
-  注册子代理 + skill（结构化类型 + 可选链，宿主形状变了静默降级，不抛错）。
-- 两入口写的是**不相交的注册系统**（v1 `cfg.agent` vs v2 AgentDraft），并存无
-  冲突；`readV1Plugin` 只看 `server` 键，多余键被忽略（v1.18.32 源码已核实）。
-- 上游 v2 补齐 tool 注册后：把工具/transform 挪进 `setup`，`server` 保留到
-  v1 退役。
+  全功能**。hooks 形态在 1.18 宿主上是唯一路径。
+- v2 loader（读 v2 `plugins` 配置 / `.opencode/plugins/` 目录扫描）只调 `setup`。
+  **v2 已是全量对等**（change `v2-plugin-api-port`，宿主实测 opencode 2.3.2）：
+  `vision_analyze` 经 `ctx.tool.transform`（JSON Schema 入参 + 共享 execute 核心）、
+  自动放行经 `ctx.permission.hook("evaluate")`（ask→allow、deny 不碰）、
+  图片落盘/原生视觉门经 `ctx.session.hook("context")`、
+  旋钮（model/disable/temperature/extraBody）从 agent 域的 vision-agent 记录读取。
+  结构化类型 + `?.`/typeof 守卫不变：宿主缺域 = 该注册 no-op，不抛错。
+- 两入口写的是**不相交的注册系统**，并存无冲突；`readV1Plugin` 只看 `server` 键，
+  多余键被忽略（v1.18.32 源码已核实）。
+- `server` 保留到 v1 宿主退役；共享逻辑只经 `runVisionAnalyze` 等宿主无关核心，
+  两入口各自接线，禁止一方直接调用另一方。
 
 ## 视觉路由机制（改行为前必读）
 
