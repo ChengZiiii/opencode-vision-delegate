@@ -22,4 +22,4 @@
 - [x] 4.1 `engines.opencode` → `^1.18.0 || ^2.0.0`; README V2 install section (V2 `plugins` config shape + local discovery rules); AGENTS.md architecture row updated — verify: manifest JSON valid, docs sections present
 - [x] 4.2 Version bump, `bun run bundle`, dist self-containment re-check (no new imports) — verify: `npm pack --dry-run` file list unchanged in shape
 - [x] 4.3 V1 host regression: full suite + typecheck + a 1.19.5 sandbox load with a hand-written config — verify: recorded outputs
-- [ ] 4.4 `openspec validate --all` green and change status complete — verify: CLI output; archive only on the user's explicit word
+- [x] 4.4 `openspec validate --all` green and change status complete — verify: CLI output; archive only on the user's explicit word
