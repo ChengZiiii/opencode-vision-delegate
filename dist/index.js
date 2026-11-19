@@ -13060,9 +13060,11 @@ The prompt contains a Visual Task (the exact visual question), Images to Inspect
 - Emit exactly one JSON object: no prose, markdown fences, commentary, or extra keys.
 - Do not spawn subagents. You are a leaf in the execution tree.`;
 var registeredModels = new Map;
-var visionModelKeys = new Set;
-var agentVisionCapable = new Map;
-var defaultVisionCapable = false;
+var v1Capability = {
+  keys: new Set,
+  agents: new Map,
+  default: false
+};
 var IMAGE_TMP_DIR = join(tmpdir(), "opencode-vision-delegate");
 var PERMISSION = {
   edit: "deny",
@@ -13281,15 +13283,18 @@ function configuredModelVisionCapable(model, catalog, config2) {
   const match = models[foldKey(models, parts.modelID)];
   return Boolean(match && isVisionModel(match));
 }
-function userMessageVisionCapable(info) {
+function userMessageVisionCapable(info, state = v1Capability) {
   const m = info.model;
   if (m && typeof m.providerID === "string" && typeof m.modelID === "string" && (m.providerID !== "" || m.modelID !== "")) {
-    return visionModelKeys.has(`${m.providerID}/${m.modelID}`.toLowerCase());
+    return state.keys.has(`${m.providerID}/${m.modelID}`.toLowerCase());
   }
-  if (typeof info.agent === "string" && agentVisionCapable.has(info.agent)) {
-    return Boolean(agentVisionCapable.get(info.agent));
+  if (typeof info.agent === "string" && state.agents.has(info.agent)) {
+    return Boolean(state.agents.get(info.agent));
   }
-  return defaultVisionCapable;
+  return state.default;
+}
+function requestModelVisionCapable(model, state = v1Capability) {
+  return Boolean(model && typeof model.providerID === "string" && typeof model.id === "string" && state.keys.has(`${model.providerID}/${model.id}`.toLowerCase()));
 }
 function saveImagePart(url2, sessionID, partID, ext) {
   mkdirSync(IMAGE_TMP_DIR, { recursive: true });
@@ -13325,9 +13330,126 @@ function mimeToExt(mime) {
     return "gif";
   return "png";
 }
+function rewriteDroppedImages(messages, state = v1Capability) {
+  for (const m of messages) {
+    if (!m || typeof m !== "object")
+      continue;
+    const message = m;
+    if (message.info?.role !== "user")
+      continue;
+    if (userMessageVisionCapable(message.info, state))
+      continue;
+    for (const p of message.parts ?? []) {
+      if (!p || typeof p !== "object")
+        continue;
+      const part = p;
+      if (part.type !== "file")
+        continue;
+      if (!part.mime)
+        continue;
+      if (!isImageMime(part.mime))
+        continue;
+      const originalFilename = part.filename ?? "image";
+      let text;
+      try {
+        const path = saveImagePart(part.url ?? "", message.info.sessionID ?? "unknown-session", part.id ?? "unknown-part", mimeToExt(part.mime));
+        text = `[vision:dropped-image] ${JSON.stringify({
+          mime: part.mime,
+          path,
+          originalFilename
+        })}`;
+      } catch (error45) {
+        text = `[vision:dropped-image-error] ${JSON.stringify({
+          mime: part.mime,
+          originalFilename,
+          error: error45 instanceof Error ? error45.message : String(error45)
+        })}`;
+      }
+      part.type = "text";
+      part.text = text;
+      part.synthetic = true;
+    }
+  }
+}
+var NATIVE_INSTRUCTION = "[vision:native] You receive image parts natively in this session. " + "Inspect images directly from the message. Do NOT use the vision skill for plain reading " + "and do NOT delegate visual tasks to a vision-* subagent. Exception: when small text or " + "fine detail is beyond native resolution, you MAY call vision_analyze WITH a `region` " + "argument to zoom into that area of an image FILE on disk.";
+var VISION_TOOL_DESCRIPTION = "Performs a visual judgment on local image files with the configured vision model. " + "Pass `images` as [{id, path, region?}] (short contract ids plus local image paths), the exact visual " + "`question`, a `response_template` (JSON string defining the required response shape), and " + "optional `response_rules` for task-specific constraints. Returns exactly one JSON object " + "matching the response template. Optional per-image `region: [x1, y1, x2, y2]` (integer pixel " + "coordinates in the ORIGINAL image, x2/y2 exclusive, PNG only) crops that region in memory at " + "full resolution — load the full image first, then re-call with a region to zoom into small " + "text or fine detail.";
+function v1VisionToolKnobs() {
+  return {
+    disabled: visionToolDisabled,
+    model: visionToolModel,
+    temperature: visionToolTemperature,
+    extraBody: visionToolExtraBody,
+    config: visionToolConfig,
+    catalog: visionToolCatalog
+  };
+}
+async function runVisionAnalyze(args, ctx, knobs) {
+  if (knobs.disabled) {
+    throw new Error('vision_analyze: vision-agent is disabled: set disable: false on agent["vision-agent"] to use this tool');
+  }
+  if (!knobs.model) {
+    throw new Error('vision_analyze: model not configured: set agent["vision-agent"].model to a vision-capable ' + 'provider/model (e.g. "minimax-cn-coding-plan/MiniMax-M3")');
+  }
+  const parts = splitModel(knobs.model);
+  if (!parts) {
+    throw new Error(`vision_analyze: model not configured: invalid model id "${knobs.model}" (expected "provider/model")`);
+  }
+  const models = providerModels(parts.provider, knobs.catalog, knobs.config);
+  const match = models[foldKey(models, parts.modelID)];
+  if (!match || !isVisionModel(match)) {
+    throw new Error(`vision_analyze: model not configured: ${knobs.model} is not image-capable; set ` + 'agent["vision-agent"].model to a vision-capable model');
+  }
+  const endpoint = resolveVisionEndpoint(parts.provider, knobs.catalog, knobs.config, process.env);
+  if (!endpoint.ok)
+    throw new Error(`vision_analyze: provider error: ${endpoint.error}`);
+  const apiKey = resolveVisionApiKey(parts.provider, knobs.catalog, knobs.config, readAuthData(), process.env);
+  if (!apiKey.ok)
+    throw new Error(`vision_analyze: provider error: ${apiKey.error}`);
+  const images = [];
+  const disclosures = [];
+  for (const image of args.images) {
+    const path = isAbsolute(image.path) ? image.path : typeof ctx.directory === "string" ? join(ctx.directory, image.path) : image.path;
+    if (!existsSync(path)) {
+      throw new Error(`vision_analyze: missing image: ${path}`);
+    }
+    let prepared;
+    try {
+      prepared = prepareVisionImage({ id: image.id, path, region: image.region });
+    } catch (error45) {
+      if (error45 instanceof VisionCropError) {
+        throw new Error(`vision_analyze: crop error: ${error45.message}`);
+      }
+      throw error45;
+    }
+    if (prepared.disclosure)
+      disclosures.push(prepared.disclosure);
+    images.push({
+      id: prepared.id,
+      path: prepared.path,
+      base64: prepared.base64,
+      ...prepared.mime ? { mime: prepared.mime } : {}
+    });
+  }
+  const question = disclosures.length ? `${args.question}
+
+Region crop coordinate mapping:
+${disclosures.join(`
+`)}` : args.question;
+  const request = buildVisionRequest(parts.modelID, endpoint.value, images, question, args.response_template, args.response_rules, apiKey.value, { temperature: knobs.temperature, extraBody: knobs.extraBody });
+  const result = await postVisionRequest(request, {
+    signal: ctx.abort,
+    timeoutMs: resolveVisionToolTimeoutMs()
+  });
+  if (!result.ok)
+    throw new Error(`vision_analyze: provider error: ${result.error}`);
+  const parsed = parseVisionResponse(result.text);
+  if (!parsed.ok)
+    throw new Error(`vision_analyze: invalid response: ${parsed.error}`);
+  return parsed.text;
+}
 function visionAnalyzeTool() {
   return tool({
-    description: "Performs a visual judgment on local image files with the configured vision model. " + "Pass `images` as [{id, path, region?}] (short contract ids plus local image paths), the exact visual " + "`question`, a `response_template` (JSON string defining the required response shape), and " + "optional `response_rules` for task-specific constraints. Returns exactly one JSON object " + "matching the response template. Optional per-image `region: [x1, y1, x2, y2]` (integer pixel " + "coordinates in the ORIGINAL image, x2/y2 exclusive, PNG only) crops that region in memory at " + "full resolution — load the full image first, then re-call with a region to zoom into small " + "text or fine detail.",
+    description: VISION_TOOL_DESCRIPTION,
     args: {
       images: tool.schema.array(tool.schema.object({
         id: tool.schema.string(),
@@ -13339,68 +13461,7 @@ function visionAnalyzeTool() {
       response_rules: tool.schema.optional(tool.schema.string())
     },
     async execute(args, ctx) {
-      if (visionToolDisabled) {
-        throw new Error('vision_analyze: vision-agent is disabled: set disable: false on agent["vision-agent"] to use this tool');
-      }
-      if (!visionToolModel) {
-        throw new Error('vision_analyze: model not configured: set agent["vision-agent"].model to a vision-capable ' + 'provider/model (e.g. "minimax-cn-coding-plan/MiniMax-M3")');
-      }
-      const parts = splitModel(visionToolModel);
-      if (!parts) {
-        throw new Error(`vision_analyze: model not configured: invalid model id "${visionToolModel}" (expected "provider/model")`);
-      }
-      const models = providerModels(parts.provider, visionToolCatalog, visionToolConfig);
-      const match = models[foldKey(models, parts.modelID)];
-      if (!match || !isVisionModel(match)) {
-        throw new Error(`vision_analyze: model not configured: ${visionToolModel} is not image-capable; set ` + 'agent["vision-agent"].model to a vision-capable model');
-      }
-      const endpoint = resolveVisionEndpoint(parts.provider, visionToolCatalog, visionToolConfig, process.env);
-      if (!endpoint.ok)
-        throw new Error(`vision_analyze: provider error: ${endpoint.error}`);
-      const apiKey = resolveVisionApiKey(parts.provider, visionToolCatalog, visionToolConfig, readAuthData(), process.env);
-      if (!apiKey.ok)
-        throw new Error(`vision_analyze: provider error: ${apiKey.error}`);
-      const images = [];
-      const disclosures = [];
-      for (const image of args.images) {
-        const path = isAbsolute(image.path) ? image.path : join(ctx.directory, image.path);
-        if (!existsSync(path)) {
-          throw new Error(`vision_analyze: missing image: ${path}`);
-        }
-        let prepared;
-        try {
-          prepared = prepareVisionImage({ id: image.id, path, region: image.region });
-        } catch (error45) {
-          if (error45 instanceof VisionCropError) {
-            throw new Error(`vision_analyze: crop error: ${error45.message}`);
-          }
-          throw error45;
-        }
-        if (prepared.disclosure)
-          disclosures.push(prepared.disclosure);
-        images.push({
-          id: prepared.id,
-          path: prepared.path,
-          base64: prepared.base64,
-          ...prepared.mime ? { mime: prepared.mime } : {}
-        });
-      }
-      const question = disclosures.length ? `${args.question}
-
-Region crop coordinate mapping:
-${disclosures.join(`
-`)}` : args.question;
-      const request = buildVisionRequest(parts.modelID, endpoint.value, images, question, args.response_template, args.response_rules, apiKey.value, { temperature: visionToolTemperature, extraBody: visionToolExtraBody });
-      const result = await postVisionRequest(request, {
-        signal: ctx.abort,
-        timeoutMs: resolveVisionToolTimeoutMs()
-      });
-      if (!result.ok)
-        throw new Error(`vision_analyze: provider error: ${result.error}`);
-      const parsed = parseVisionResponse(result.text);
-      if (!parsed.ok)
-        throw new Error(`vision_analyze: invalid response: ${parsed.error}`);
-      return parsed.text;
+      return runVisionAnalyze(args, ctx, v1VisionToolKnobs());
     }
   });
 }
@@ -13409,13 +13470,13 @@ var plugin = async () => ({
     const catalog = readModelsCatalog();
     const dynamicModels = discoverVisionModels(catalog, cfg);
     registeredModels = new Map(dynamicModels.map((m) => [`${m.provider}/${m.model_id}`, m]));
-    visionModelKeys = buildVisionModelKeys(catalog, cfg);
-    defaultVisionCapable = configuredModelVisionCapable(cfg.model, catalog, cfg);
-    agentVisionCapable = new Map;
+    v1Capability.keys = buildVisionModelKeys(catalog, cfg);
+    v1Capability.default = configuredModelVisionCapable(cfg.model, catalog, cfg);
+    v1Capability.agents = new Map;
     const agentsSection = cfg.agent ?? {};
     for (const [name, entry] of Object.entries(agentsSection)) {
       if (entry && typeof entry.model === "string") {
-        agentVisionCapable.set(name, configuredModelVisionCapable(entry.model, catalog, cfg));
+        v1Capability.agents.set(name, configuredModelVisionCapable(entry.model, catalog, cfg));
       }
     }
     const cfgAny = cfg;
@@ -13454,52 +13515,177 @@ var plugin = async () => ({
     }
   },
   "experimental.chat.messages.transform": async (_input, output) => {
-    for (const m of output.messages) {
-      if (m.info.role !== "user")
-        continue;
-      if (userMessageVisionCapable(m.info))
-        continue;
-      for (const part of m.parts) {
-        if (part.type !== "file")
-          continue;
-        if (!part.mime)
-          continue;
-        if (!isImageMime(part.mime))
-          continue;
-        const originalFilename = part.filename ?? "image";
-        let text;
-        try {
-          const path = saveImagePart(part.url, m.info.sessionID, part.id, mimeToExt(part.mime));
-          text = `[vision:dropped-image] ${JSON.stringify({
-            mime: part.mime,
-            path,
-            originalFilename
-          })}`;
-        } catch (error45) {
-          text = `[vision:dropped-image-error] ${JSON.stringify({
-            mime: part.mime,
-            originalFilename,
-            error: error45 instanceof Error ? error45.message : String(error45)
-          })}`;
-        }
-        part.type = "text";
-        part.text = text;
-        part.synthetic = true;
-      }
-    }
+    rewriteDroppedImages(output.messages, v1Capability);
   },
   "experimental.chat.system.transform": async (input, output) => {
-    const model = input.model;
-    const capable = Boolean(model && typeof model.providerID === "string" && typeof model.id === "string" && visionModelKeys.has(`${model.providerID}/${model.id}`.toLowerCase()));
-    if (capable) {
-      output.system.push("[vision:native] You receive image parts natively in this session. " + "Inspect images directly from the message. Do NOT use the vision skill for plain reading " + "and do NOT delegate visual tasks to a vision-* subagent. Exception: when small text or " + "fine detail is beyond native resolution, you MAY call vision_analyze WITH a `region` " + "argument to zoom into that area of an image FILE on disk.");
+    if (requestModelVisionCapable(input.model, v1Capability)) {
+      output.system.push(NATIVE_INSTRUCTION);
       return;
     }
   }
 });
+var VISION_ANALYZE_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    images: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          path: { type: "string" },
+          region: {
+            type: "array",
+            items: { type: "integer" },
+            minItems: 4,
+            maxItems: 4
+          }
+        },
+        required: ["id", "path"]
+      }
+    },
+    question: { type: "string" },
+    response_template: { type: "string" },
+    response_rules: { type: "string" }
+  },
+  required: ["images", "question", "response_template"]
+};
+function wrapV2ToolResult(text) {
+  return { content: text };
+}
+function readV2AgentKnobs(record2) {
+  const agent = record2 ?? {};
+  let model;
+  const m = agent.model;
+  if (typeof m === "string" && m)
+    model = m;
+  else if (m && typeof m === "object" && typeof m.id === "string" && typeof m.providerID === "string") {
+    model = `${m.providerID}/${m.id}`;
+  }
+  const temperatureCandidate = agent.request?.settings?.temperature;
+  return {
+    model,
+    disabled: agent.disable === true || agent.disabled === true,
+    temperature: typeof temperatureCandidate === "number" && Number.isFinite(temperatureCandidate) ? temperatureCandidate : typeof agent.temperature === "number" && Number.isFinite(agent.temperature) ? agent.temperature : undefined,
+    extraBody: agent.request?.body && typeof agent.request.body === "object" && !Array.isArray(agent.request.body) ? agent.request.body : agent.extraBody && typeof agent.extraBody === "object" && !Array.isArray(agent.extraBody) ? agent.extraBody : undefined
+  };
+}
+function v2PermissionEvaluate(event) {
+  try {
+    const e = event ?? {};
+    const name = (typeof e.action === "string" ? e.action : undefined) ?? (typeof e.metadata?.tool === "string" ? e.metadata.tool : undefined) ?? (typeof e.permission === "string" ? e.permission : undefined) ?? (typeof e.id === "string" ? e.id : undefined) ?? (typeof e.type === "string" ? e.type : undefined);
+    if (name !== VISION_TOOL_NAME)
+      return;
+    if (e.effect === "ask")
+      e.effect = "allow";
+    else if (e.decision && typeof e.decision === "object") {
+      if (e.decision.status === "ask")
+        e.decision.status = "allow";
+    } else if (e.status === "ask") {
+      e.status = "allow";
+    }
+  } catch {}
+}
+function rewriteDroppedImagesV2(messages, capable, sessionID) {
+  if (capable)
+    return;
+  for (const m of messages) {
+    if (!m || typeof m !== "object")
+      continue;
+    const message = m;
+    if (message.role !== "user")
+      continue;
+    if (!Array.isArray(message.content))
+      continue;
+    for (const p of message.content) {
+      if (!p || typeof p !== "object")
+        continue;
+      const part = p;
+      if (part.type !== "media" || !part.media?.source)
+        continue;
+      const mediaType = typeof part.media.source.mediaType === "string" ? part.media.source.mediaType : typeof part.media.mediaType === "string" ? part.media.mediaType : "";
+      if (!isImageMime(mediaType))
+        continue;
+      const originalFilename = typeof part.filename === "string" ? part.filename : "image";
+      const payload = part.media.source.type === "base64" && typeof part.media.source.data === "string" ? `data:${mediaType};base64,${part.media.source.data}` : typeof part.media.source.url === "string" ? part.media.source.url : "";
+      let text;
+      try {
+        const path = saveImagePart(payload, sessionID, `${message.id ?? "msg"}-${originalFilename}-${message.content.indexOf(p)}`, mimeToExt(mediaType));
+        text = `[vision:dropped-image] ${JSON.stringify({
+          mime: mediaType,
+          path,
+          originalFilename
+        })}`;
+      } catch (error45) {
+        text = `[vision:dropped-image-error] ${JSON.stringify({
+          mime: mediaType,
+          originalFilename,
+          error: error45 instanceof Error ? error45.message : String(error45)
+        })}`;
+      }
+      const mutable = part;
+      mutable.type = "text";
+      mutable.text = text;
+      delete mutable.media;
+    }
+  }
+}
+function v2SessionContext(event, state) {
+  try {
+    const e = event ?? {};
+    const capable = requestModelVisionCapable(e.model, state);
+    if (Array.isArray(e.system) && capable) {
+      if (e.system.length === 0 || typeof e.system[0] === "object") {
+        e.system.push({ type: "text", text: NATIVE_INSTRUCTION });
+      } else {
+        e.system.push(NATIVE_INSTRUCTION);
+      }
+    }
+    if (Array.isArray(e.messages)) {
+      rewriteDroppedImagesV2(e.messages, capable, typeof e.sessionID === "string" ? e.sessionID : "unknown-session");
+    }
+  } catch {}
+}
 async function v2Setup(ctx) {
+  const catalog = readModelsCatalog();
+  const optionsConfig = ctx.options && typeof ctx.options === "object" ? ctx.options : {};
+  const v2Capability = {
+    keys: buildVisionModelKeys(catalog, optionsConfig),
+    agents: new Map,
+    default: configuredModelVisionCapable(optionsConfig.model, catalog, optionsConfig)
+  };
+  let v2Knobs = {
+    disabled: false,
+    model: undefined,
+    temperature: undefined,
+    extraBody: undefined,
+    config: optionsConfig,
+    catalog
+  };
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform(async (draft) => {
+      if (typeof draft.get === "function") {
+        const record2 = draft.get("vision-agent");
+        if (record2 !== undefined) {
+          const knobs = readV2AgentKnobs(record2);
+          v2Knobs = {
+            ...knobs,
+            config: optionsConfig,
+            catalog
+          };
+        }
+      }
+      if (typeof draft.list === "function") {
+        for (const entry of draft.list() ?? []) {
+          if (!entry || typeof entry.id !== "string")
+            continue;
+          const record2 = typeof draft.get === "function" ? draft.get(entry.id) : undefined;
+          const model = record2?.model;
+          if (typeof model === "string") {
+            v2Capability.agents.set(entry.id, configuredModelVisionCapable(model, catalog, optionsConfig));
+          }
+        }
+      }
       if (typeof draft.get !== "function" || typeof draft.update !== "function")
         return;
       if (draft.get("vision-agent") !== undefined)
@@ -13513,10 +13699,45 @@ async function v2Setup(ctx) {
   }
   if (typeof ctx.skill?.transform === "function") {
     await ctx.skill.transform(async (draft) => {
-      if (typeof draft.source !== "function")
+      if (typeof draft.source === "function") {
+        draft.source({ type: "directory", path: dataDir });
         return;
-      draft.source({ type: "directory", path: dataDir });
+      }
+      if (typeof draft.add !== "function")
+        return;
+      const skillPath = join(dataDir, "SKILL.md");
+      try {
+        const content = readFileSync2(skillPath, "utf8");
+        draft.add({
+          id: "vision",
+          name: "vision",
+          description: "Visual intent detection and delegation routing (vision_analyze tool first, vision-agent subagent fallback) for text-only models.",
+          path: skillPath,
+          content
+        });
+      } catch {}
     });
+  }
+  if (!v2Knobs.disabled && typeof ctx.tool?.transform === "function") {
+    await ctx.tool.transform(async (editor) => {
+      if (typeof editor?.add !== "function")
+        return;
+      editor.add({
+        name: VISION_TOOL_NAME,
+        description: VISION_TOOL_DESCRIPTION,
+        input: VISION_ANALYZE_INPUT_SCHEMA,
+        async execute(args, toolCtx) {
+          const text = await runVisionAnalyze(args, toolCtx ?? {}, v2Knobs);
+          return wrapV2ToolResult(text);
+        }
+      });
+    });
+  }
+  if (typeof ctx.permission?.hook === "function") {
+    ctx.permission.hook("evaluate", (event) => v2PermissionEvaluate(event));
+  }
+  if (typeof ctx.session?.hook === "function") {
+    ctx.session.hook("context", (event) => v2SessionContext(event, v2Capability));
   }
 }
 var plugin_default = { id: "vision", server: plugin, setup: v2Setup };
