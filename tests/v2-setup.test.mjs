@@ -62,7 +62,7 @@ after(() => {
   rmSync(configTmp, { recursive: true, force: true })
 })
 
-const { default: pluginEntry } = await import("../plugin.ts")
+const { default: pluginEntry, stripJsoncForParse } = await import("../plugin.ts")
 
 // Small deterministic PNG for the execute path.
 const { encodePng } = await import("../src/vision-crop.ts")
@@ -546,4 +546,143 @@ test("v2 capability map: post-merge domain list/get refreshes agents map at cont
   // Indirect observable: none yet (v2 routing keys off the request model) —
   // assert the refresh itself ran without throwing and the hook still works.
   assert.equal(event.system.length, 0, "text-only model: no injection")
+})
+
+// --- harden-tests wave: P2 class-instance record shape + config-fallback edges --
+
+// P2 sandbox verdict (design.md "Post-apply sandbox verdict"): records fetched
+// through the live domain handle serialize to `{}` (class-instance shape —
+// prototype getters are invisible to JSON) while DIRECT property access may
+// still read merged fields. This test pins the main path under BOTH shapes:
+// whatever the host serves, execute resolves the knobs.
+test("v2 knobs P2: class-instance record (prototype getters) — serializes to {} but property access resolves knobs", async () => {
+  class HostAgentRecord {
+    get model() {
+      return { id: "vm", providerID: "fakeprov", variant: "low" }
+    }
+    get request() {
+      return { settings: { temperature: 0.3 } }
+    }
+  }
+  const record = new HostAgentRecord()
+  // shape premise: JSON hides the prototype getters, access does not
+  assert.equal(JSON.stringify(record), "{}", "premise: the record serializes to {} (P2 observation)")
+  assert.ok(record.model, "premise: direct property access reads the merged model")
+  const { ctx, state } = makeCtx()
+  ctx.agent = {
+    transform: async (cb) => cb({ get: () => undefined, list: () => [] }),
+    get: (id) => (id === "vision-agent" ? record : undefined),
+    list: () => [{ id: "vision-agent" }],
+  }
+  await pluginEntry.setup(ctx)
+  stubFetch()
+  const result = await state.tools[0].execute(
+    { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+    { directory: tmp },
+  )
+  assert.deepEqual(result, { content: '{"ok":true}' })
+  const body = JSON.parse(captured[0].body)
+  assert.equal(body.model, "vm", "model resolved off the prototype getter (variant folds away)")
+  assert.equal(body.temperature, 0.3, "request.settings.temperature resolved off the prototype getter")
+})
+
+// The hostile corner of the same shape: a getter that THROWS must degrade to
+// the next source (config file), never propagate into execute.
+test("v2 knobs P2: a throwing prototype getter degrades to the config-file fallback, never throws", async () => {
+  class ThrowingRecord {
+    get model() {
+      throw new Error("getter boom")
+    }
+  }
+  const cfgDir = mkdtempSync(join(tmpdir(), "v2-knob-throw-"))
+  writeFileSync(join(cfgDir, "opencode.json"), JSON.stringify({ agent: { "vision-agent": { model: "fakeprov/vm" } } }))
+  const prevCfg = process.env.OPENCODE_CONFIG_DIR
+  process.env.OPENCODE_CONFIG_DIR = cfgDir
+  try {
+    const { ctx, state } = makeCtx()
+    ctx.agent = {
+      transform: async (cb) => cb({ get: () => undefined, list: () => [] }),
+      get: (id) => (id === "vision-agent" ? new ThrowingRecord() : undefined),
+      list: () => [{ id: "vision-agent" }],
+    }
+    await pluginEntry.setup(ctx)
+    stubFetch()
+    const result = await state.tools[0].execute(
+      { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+      { directory: tmp },
+    )
+    assert.deepEqual(result, { content: '{"ok":true}' }, "no throw — resolution fell through to the config file")
+    assert.equal(JSON.parse(captured[0].body).model, "vm", "model served by the fallback source")
+  } finally {
+    if (prevCfg === undefined) delete process.env.OPENCODE_CONFIG_DIR
+    else process.env.OPENCODE_CONFIG_DIR = prevCfg
+    rmSync(cfgDir, { recursive: true, force: true })
+  }
+})
+
+// Fallback edge: OPENCODE_CONFIG_DIR pointing at a NONEXISTENT directory —
+// no error, graceful degradation to unset (exact VT-2 error, no invented model).
+test("v2 knobs fallback: OPENCODE_CONFIG_DIR at a nonexistent directory degrades to unset", async () => {
+  const prevCfg = process.env.OPENCODE_CONFIG_DIR
+  process.env.OPENCODE_CONFIG_DIR = join(tmp, "definitely-not-here")
+  try {
+    const { ctx, state } = makeCtx()
+    ctx.agent = { transform: async (cb) => cb({ get: () => undefined, list: () => [] }) }
+    await pluginEntry.setup(ctx)
+    assert.equal(state.tools.length, 1, "tool still registered (no throw at setup)")
+    stubFetch()
+    await assert.rejects(
+      state.tools[0].execute(
+        { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+        { directory: tmp },
+      ),
+      /vision_analyze: model not configured: set agent\["vision-agent"\]\.model/,
+    )
+    assert.equal(captured.length, 0)
+  } finally {
+    if (prevCfg === undefined) delete process.env.OPENCODE_CONFIG_DIR
+    else process.env.OPENCODE_CONFIG_DIR = prevCfg
+  }
+})
+
+// JSONC state-machine boundary: "//" inside string literals is DATA, not a
+// comment opener — asserted both directly on the exported stripper and through
+// a full fixture where the URL string precedes the agent knobs.
+test("v2 knobs fallback: '//' inside string literals survives the strip (state machine does not eat URLs)", async () => {
+  const url = "https://example.test/v1//double"
+  const stripped = stripJsoncForParse(`{"url":"${url}" // real comment
+}`)
+  assert.deepEqual(JSON.parse(stripped), { url }, "the URL string literal is byte-identical after stripping")
+  // block comment + trailing comma combination, with the '//' string in front
+  const cfgDir = mkdtempSync(join(tmpdir(), "v2-knob-jsonc-"))
+  const cfgFile = join(cfgDir, "opencode.jsonc")
+  const cfgContent = `{
+  // docs: ${url}
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "vision-agent": {
+      "model": "fakeprov/vm", /* inline block */ "temperature": 0.6,
+    },
+  },
+}`
+  writeFileSync(cfgFile, cfgContent)
+  const prevCfg = process.env.OPENCODE_CONFIG_DIR
+  process.env.OPENCODE_CONFIG_DIR = cfgDir
+  try {
+    const { ctx, state } = makeCtx()
+    ctx.agent = { transform: async (cb) => cb({ get: () => undefined, list: () => [] }) }
+    await pluginEntry.setup(ctx)
+    stubFetch()
+    await state.tools[0].execute(
+      { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+      { directory: tmp },
+    )
+    const body = JSON.parse(captured[0].body)
+    assert.equal(body.model, "vm", "knobs resolve through the block-comment + trailing-combo fixture")
+    assert.equal(body.temperature, 0.6)
+  } finally {
+    if (prevCfg === undefined) delete process.env.OPENCODE_CONFIG_DIR
+    else process.env.OPENCODE_CONFIG_DIR = prevCfg
+    rmSync(cfgDir, { recursive: true, force: true })
+  }
 })
