@@ -101,3 +101,25 @@ Knobs become a function of the record at EXECUTE time, not a snapshot:
   limitation — `refreshV2AgentsMap()` re-reads the domain `list`/`get` at
   every session-context hook when available; on hosts without a post-merge
   list the transform-time map persists (README documents the limitation).
+
+## Post-apply sandbox verdict (P2, 2.3.2, 2026-11-20)
+
+Execute-time readability probed on a sandbox host (probe report in the
+forge workspace, `reports/probe-v2-surface-report.md`):
+
+- The agent domain handle is ALIVE at execute time (`get`, `list`,
+  `transform`, `reload` all present; `exists: true`) — the primary
+  resolution source is reachable, as designed.
+- BUT records fetched through it serialize to `{}` (class-instance
+  shape) and `list()` returns a non-array. Whether DIRECT property
+  access (`record.model`) still reads merged fields is NOT decidable
+  from this evidence — prototype getters are invisible to JSON
+  serialization, so `{}` is a serialization fact, not necessarily an
+  access fact.
+- Consequence: the layered source order stands unchanged. If direct
+  access works, the domain getter resolves knobs as designed; if it
+  does not, resolution degrades to the config-file fallback — which
+  reads the same file the config→agent merge read, so the resolved
+  values are identical either way. User-visible behavior is correct on
+  2.3.2 in both branches; the live-host verification (task 4.2) will
+  observe which layer actually serves.
