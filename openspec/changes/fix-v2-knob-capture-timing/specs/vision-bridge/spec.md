@@ -49,3 +49,67 @@ execute time nor a discoverable user config,
 when `vision_analyze` executes,
 then the tool returns the exact `model not configured` error naming
 `agent["vision-agent"].model` (no invented model, no HTTP request).
+
+## MODIFIED Requirements
+
+### Requirement: VH-2: V2 host routing and knob parity
+
+**Requirement:** On a V2 host, the routing behavior of RV-1/RV-2 `SHALL` be
+carried by a `ctx.session.hook("context", ...)` registration that edits the
+event's messages and system arrays with the same semantics as the V1
+transforms: image `FilePart`s of user messages whose handling model is not
+vision-capable `SHALL` be materialized to the plugin temp dir and rewritten
+to `[vision:dropped-image]` markers (same resolution chain: message model →
+agent name → top-level default, case-insensitive, availability-ungated), and
+requests handled by a vision-capable model `SHALL` receive the single
+`[vision:native]` system instruction while text-only models receive no
+injection. The tool knobs (`model`, `disable`, `temperature`, `extraBody`)
+`SHALL` be resolved LAZILY at execute time from a post-merge observation of
+the user's `vision-agent` agent record — the agent domain's record when its
+getter is reachable, else a read-only parse of the user's config file
+(`OPENCODE_CONFIG_DIR` aware, JSONC tolerant, never written) — never from a
+transform-time snapshot alone (the plugin still never writes `model` or
+`disabled`); a record that is unset or unreachable on BOTH sources degrades
+to the exact VT-2 `model not configured` error contract. The capability map
+the router consults (which agent ids are vision-capable) `SHALL` be re-read
+from the agent domain at each session-context hook when the domain exposes a
+post-merge list/get; hosts without such a surface keep the transform-time
+map (a documented README limitation). All error-category prefixes `SHALL`
+stay byte-identical to the V1 path so SKILL.md routing (VT-4) is unaffected.
+
+#### Scenario: Text-only model gets markers on V2
+
+- **WHEN** a user message carrying an image part is handled by a text-only
+  model on a V2 host
+- **THEN** the image is materialized under the plugin temp dir and the part
+  is rewritten to a `[vision:dropped-image]` marker carrying the path
+
+#### Scenario: Vision-capable model gets the native instruction on V2
+
+- **WHEN** a request is handled by a vision-capable model on a V2 host
+- **THEN** the event system array receives the `[vision:native]`
+  instruction and image parts pass through unchanged
+
+#### Scenario: Knobs resolve from the agent record on V2
+
+- **WHEN** the user sets `model` (and optionally `temperature`/`extraBody`)
+  on their config's `vision-agent` entry and the v2 host merges config agent
+  entries only after plugin transforms
+- **THEN** `vision_analyze` targets that model with those request knobs
+  (resolved lazily at execute time — the empty transform-time snapshot did
+  not matter), and the plugin has written no `model`/`disabled` field
+  anywhere
+
+#### Scenario: Unset model keeps the fixable error on V2
+
+- **WHEN** `vision_analyze` executes on a V2 host with no model configured
+- **THEN** the error is the `model not configured` category naming
+  `agent["vision-agent"].model`, and no HTTP request is made
+
+#### Scenario: The capability map refreshes post-merge when the domain allows
+
+- **WHEN** a v2 host exposes an agent-domain list/get that reflects merged
+  records and a session-context hook fires
+- **THEN** the router's capability map is re-read from the domain
+  (config-declared agent capabilities are honored); on hosts without such a
+  surface the transform-time map persists and the README limitation applies
