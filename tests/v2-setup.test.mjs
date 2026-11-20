@@ -14,11 +14,15 @@
 // is stubbed.
 import { test, before, after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { mkdtempSync, writeFileSync, rmSync, readdirSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 const tmp = mkdtempSync(join(tmpdir(), "v2-setup-test-"))
+// Isolated config dir (fix-v2-knob-capture-timing): the config-file fallback
+// reads the host's global config — tests must not observe the developer's
+// real ~/.config/opencode/opencode.json.
+const configTmp = mkdtempSync(join(tmpdir(), "v2-setup-cfg-"))
 
 const CATALOG = {
   fakeprov: {
@@ -36,12 +40,14 @@ const AUTH = JSON.stringify({ fakeprov: { type: "api", key: "test-key" } })
 const PREV = {
   models: process.env.OPENCODE_MODELS_PATH,
   auth: process.env.OPENCODE_AUTH_CONTENT,
+  configDir: process.env.OPENCODE_CONFIG_DIR,
   fetch: globalThis.fetch,
 }
 
 before(() => {
   process.env.OPENCODE_MODELS_PATH = CATALOG_FILE
   process.env.OPENCODE_AUTH_CONTENT = AUTH
+  process.env.OPENCODE_CONFIG_DIR = configTmp
 })
 
 after(() => {
@@ -49,8 +55,11 @@ after(() => {
   else process.env.OPENCODE_MODELS_PATH = PREV.models
   if (PREV.auth === undefined) delete process.env.OPENCODE_AUTH_CONTENT
   else process.env.OPENCODE_AUTH_CONTENT = PREV.auth
+  if (PREV.configDir === undefined) delete process.env.OPENCODE_CONFIG_DIR
+  else process.env.OPENCODE_CONFIG_DIR = PREV.configDir
   globalThis.fetch = PREV.fetch
   rmSync(tmp, { recursive: true, force: true })
+  rmSync(configTmp, { recursive: true, force: true })
 })
 
 const { default: pluginEntry } = await import("../plugin.ts")
@@ -423,4 +432,118 @@ test("v2 agent create-only: existing vision-agent record is not overwritten", as
   state.agents.set("vision-agent", userRecord)
   await pluginEntry.setup(ctx)
   assert.deepEqual(state.agents.get("vision-agent"), userRecord)
+})
+
+// --- fix-v2-knob-capture-timing: lazy execute-time resolution ---------------
+
+// Ordering regression (the live 2.3.2 failure as a test): the transform-time
+// draft.get("vision-agent") is undefined (user config merges AFTER plugin
+// transforms), but the agent domain's own getter returns the MERGED record
+// once transforms settle — execute must resolve the model anyway.
+test("v2 knobs ordering: transform sees undefined, domain getter returns merged record -> execute resolves model", async () => {
+  const { ctx, state } = makeCtx()
+  const mergedRecord = {
+    model: { id: "vm", providerID: "fakeprov", variant: "low" },
+    request: { settings: { temperature: 0.2 } },
+  }
+  // Simulated 2.3.2 ordering: empty draft at transform time; the domain's
+  // get() serves the merged record after all transforms finished.
+  ctx.agent = {
+    transform: async (cb) => cb({ get: () => undefined, list: () => [] }),
+    get: (id) => (id === "vision-agent" ? mergedRecord : undefined),
+    list: () => [{ id: "vision-agent" }],
+  }
+  await pluginEntry.setup(ctx)
+  assert.equal(state.tools.length, 1, "tool registered (merged disable not visible -> not suppressed)")
+  stubFetch()
+  const result = await state.tools[0].execute(
+    { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+    { directory: tmp },
+  )
+  assert.deepEqual(result, { content: '{"ok":true}' })
+  assert.equal(captured.length, 1, "no 'model not configured' — the merged record was observed")
+  const body = JSON.parse(captured[0].body)
+  assert.equal(body.model, "vm", "model knob from the merged record (variant folds to provider/id)")
+  assert.equal(body.temperature, 0.2)
+})
+
+// Fallback path: no domain getter AND transform saw nothing -> the config
+// file (OPENCODE_CONFIG_DIR, JSONC-tolerant) supplies the knobs; zero writes.
+test("v2 knobs fallback: no domain getter + JSONC config fixture -> knobs resolve, zero file writes", async () => {
+  const cfgDir = mkdtempSync(join(tmpdir(), "v2-knob-cfg-"))
+  const cfgFile = join(cfgDir, "opencode.jsonc")
+  const cfgContent = `{
+  // user config with comments (JSONC)
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "vision-agent": {
+      "model": "fakeprov/vm", /* inline comment */
+      "temperature": 0.5,
+      "extraBody": { "top_p": 0.8, },
+    },
+  },
+}`
+  writeFileSync(cfgFile, cfgContent)
+  const prevCfg = process.env.OPENCODE_CONFIG_DIR
+  process.env.OPENCODE_CONFIG_DIR = cfgDir
+  try {
+    const { ctx, state } = makeCtx()
+    // No domain getter; the transform draft never carries the record.
+    ctx.agent = { transform: async (cb) => cb({ get: () => undefined, list: () => [] }) }
+    await pluginEntry.setup(ctx)
+    assert.equal(state.tools.length, 1)
+    stubFetch()
+    await state.tools[0].execute(
+      { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+      { directory: tmp },
+    )
+    const body = JSON.parse(captured[0].body)
+    assert.equal(body.model, "vm", "model knob from the config-file fallback")
+    assert.equal(body.temperature, 0.5)
+    assert.equal(body.top_p, 0.8, "extraBody propagated from the fallback")
+    // Zero-write contract: the fixture is byte-identical and the dir gained nothing.
+    assert.equal(readFileSync(cfgFile, "utf8"), cfgContent, "config file never rewritten")
+    assert.deepEqual(readdirSync(cfgDir), ["opencode.jsonc"], "no files added to the config dir")
+  } finally {
+    if (prevCfg === undefined) delete process.env.OPENCODE_CONFIG_DIR
+    else process.env.OPENCODE_CONFIG_DIR = prevCfg
+    rmSync(cfgDir, { recursive: true, force: true })
+  }
+})
+
+// Fallback miss: no domain getter, no readable config -> byte-identical
+// VT-2 "model not configured" error (no invented default model).
+test("v2 knobs fallback: no domain getter + empty config dir -> exact 'model not configured' error", async () => {
+  const { ctx, state } = makeCtx()
+  ctx.agent = { transform: async (cb) => cb({ get: () => undefined, list: () => [] }) }
+  await pluginEntry.setup(ctx)
+  assert.equal(state.tools.length, 1)
+  stubFetch()
+  await assert.rejects(
+    state.tools[0].execute(
+      { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+      { directory: tmp },
+    ),
+    /vision_analyze: model not configured: set agent\["vision-agent"\]\.model/,
+  )
+  assert.equal(captured.length, 0)
+})
+
+// Capability map lazy refresh (task 2.2): domain list/get post-merge repopulates
+// the agent-name capability map at context-hook time.
+test("v2 capability map: post-merge domain list/get refreshes agents map at context time", async () => {
+  const { ctx, state } = makeCtx()
+  ctx.agent = {
+    transform: async (cb) => cb({ get: () => undefined, list: () => [] }),
+    get: (id) =>
+      id === "vision-agent" ? { model: { id: "vm", providerID: "fakeprov" } } : undefined,
+    list: () => [{ id: "vision-agent" }],
+  }
+  await pluginEntry.setup(ctx)
+  assert.equal(state.contextHooks.length, 1)
+  const event = { model: { providerID: "fakeprov", id: "tm" }, system: [], messages: [] }
+  await state.contextHooks[0].cb(event)
+  // Indirect observable: none yet (v2 routing keys off the request model) —
+  // assert the refresh itself ran without throwing and the hook still works.
+  assert.equal(event.system.length, 0, "text-only model: no injection")
 })
