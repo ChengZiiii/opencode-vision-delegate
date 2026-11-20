@@ -917,10 +917,18 @@ type V2ToolEditor = {
     execute: (args: unknown, ctx: unknown) => Promise<unknown>
   }): unknown
 }
+type V2AgentRecord = Record<string, unknown>
+type V2AgentDomainHandle = {
+  transform?(cb: (draft: V2AgentDraft) => void | Promise<void>): Promise<unknown>
+  // Post-merge observation point (fix-v2-knob-capture-timing): if the host
+  // domain exposes get/list OUTSIDE transform, they observe the MERGED agent
+  // record (user config agent entries are merged after plugin transforms —
+  // verified live on 2.3.2, see design.md). All uses are typeof-guarded.
+  get?(id: string): unknown
+  list?(): Array<{ id: string }>
+}
 type V2PluginContext = {
-  agent?: {
-    transform?(cb: (draft: V2AgentDraft) => void | Promise<void>): Promise<unknown>
-  }
+  agent?: V2AgentDomainHandle
   skill?: {
     transform?(cb: (draft: V2SkillDraft) => void | Promise<void>): Promise<unknown>
   }
@@ -1032,6 +1040,165 @@ function readV2AgentKnobs(record: unknown): {
         : agent.extraBody && typeof agent.extraBody === "object" && !Array.isArray(agent.extraBody)
           ? (agent.extraBody as Record<string, unknown>)
           : undefined,
+  }
+}
+
+// --- fix-v2-knob-capture-timing: lazy execute-time knob resolution ---------
+//
+// Root cause (verified live on 2.3.2, 2026-11-20): the config → agent merge
+// is the built-in plugin "opencode.agent"'s agent.transform, which runs AFTER
+// ordinary plugin transforms. A plugin reading draft.get("vision-agent")
+// inside its own transform sees `undefined` for config-defined entries while
+// the FINAL merged record carries the config's model/variant. By the time any
+// tool EXECUTES, all transforms have long finished and the merged record is
+// settled in the agent domain — so knobs are resolved lazily at execute time
+// instead of snapshotted at transform time.
+
+// Module-state seams the v2 setup entry publishes for the lazy resolver.
+let v2AgentDomain: V2AgentDomainHandle | undefined
+let v2CatalogRef: ModelsCatalog = {}
+let v2OptionsConfigRef: ConfigLike = {}
+// Knobs observed inside the agent transform (kept as a middle source: on
+// hosts where the draft DOES carry the record — e.g. a domain-created entry
+// or a host that merges config before plugin transforms — this is a valid
+// observation; on the broken ordering it is simply absent).
+let v2TransformKnobs: ReturnType<typeof readV2AgentKnobs> | undefined
+
+// Minimal JSONC tolerance for the config-file fallback: strip // and /* */
+// comments and trailing commas, skipping string literals (a naive regex would
+// eat "//" inside URLs). READ-ONLY path — nothing here ever writes.
+export function stripJsoncForParse(text: string): string {
+  let out = ""
+  let i = 0
+  const n = text.length
+  while (i < n) {
+    const c = text[i]
+    if (c === '"') {
+      out += c
+      i++
+      while (i < n && text[i] !== '"') {
+        if (text[i] === "\\") {
+          out += text[i]
+          i++
+        }
+        out += text[i]
+        i++
+      }
+      out += text[i] ?? ""
+      i++
+      continue
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < n && text[i] !== "\n") i++
+      continue
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      i += 2
+      while (i < n && !(text[i] === "*" && text[i + 1] === "/")) i++
+      i += 2
+      continue
+    }
+    out += c
+    i++
+  }
+  return out.replace(/,(\s*[}\]])/g, "$1")
+}
+
+type OpencodeFileConfig = ConfigLike & {
+  agent?: Record<string, V2AgentRecord | undefined>
+}
+
+// Config-file fallback (task 2.3): discover the host's global config the same
+// way the host documents (OPENCODE_CONFIG_DIR, else XDG ~/.config/opencode),
+// try opencode.json then opencode.jsonc, JSONC-tolerant parse. Returns
+// undefined when no readable config exists. NEVER writes.
+function readOpencodeConfigFile(): OpencodeFileConfig | undefined {
+  const dir = opencodeConfigDir()
+  for (const file of [join(dir, "opencode.json"), join(dir, "opencode.jsonc")]) {
+    try {
+      if (!existsSync(file)) continue
+      const parsed = JSON.parse(stripJsoncForParse(readFileSync(file, "utf8")))
+      if (parsed && typeof parsed === "object") return parsed as OpencodeFileConfig
+    } catch {
+      continue
+    }
+  }
+  return undefined
+}
+
+// resolveV2Knobs (task 2.1): lazy, execute-time knob resolution. Source order:
+//   1. agent-domain getter (ctx.agent.get("vision-agent")) — the merged record,
+//      the primary post-merge observation point.
+//   2. transform-time snapshot — valid wherever the draft carried the record.
+//   3. config-file fallback — the host's own discovery, read-only.
+//   4. unset — runVisionAnalyze keeps the byte-identical
+//      "model not configured" error (incl. the agent["vision-agent"].model
+//      guidance); no default model is ever invented.
+export function resolveV2Knobs(): VisionToolKnobs {
+  const base = { config: v2OptionsConfigRef, catalog: v2CatalogRef }
+  try {
+    if (typeof v2AgentDomain?.get === "function") {
+      const record = v2AgentDomain.get("vision-agent")
+      if (record !== undefined) {
+        return { ...readV2AgentKnobs(record), ...base }
+      }
+    }
+  } catch {
+    // Domain drift/thrown getter degrades to the next source, never throws.
+  }
+  if (v2TransformKnobs) return { ...v2TransformKnobs, ...base }
+  const fileConfig = readOpencodeConfigFile()
+  if (fileConfig) {
+    const entry = fileConfig.agent?.["vision-agent"]
+    if (entry !== undefined) {
+      const knobs = readV2AgentKnobs(entry)
+      if (knobs.model !== undefined || knobs.disabled || knobs.temperature !== undefined || knobs.extraBody !== undefined) {
+        return { ...knobs, config: { ...v2OptionsConfigRef, ...fileConfig }, catalog: v2CatalogRef }
+      }
+    }
+  }
+  return {
+    disabled: false,
+    model: undefined,
+    temperature: undefined,
+    extraBody: undefined,
+    ...base,
+  }
+}
+
+// Capability-map lazy refresh (task 2.2): the agent-name → vision-capability
+// map was previously built ONLY from draft.list() at transform time, which
+// cannot see config-merged agents on this host ordering. Wherever the domain
+// exposes list/get OUTSIDE transform, the map is refreshed post-merge at
+// context-hook time. On hosts without a post-merge list the transform-time map
+// (possibly incomplete) is kept and the limitation is documented in README —
+// the v2 routing decision is driven by the request MODEL first, so the map is
+// a secondary signal there anyway.
+export function refreshV2AgentsMap(state: VisionCapabilityState): void {
+  try {
+    if (typeof v2AgentDomain?.list !== "function") return
+    const entries = v2AgentDomain.list() ?? []
+    for (const entry of entries) {
+      if (!entry || typeof entry.id !== "string") continue
+      const record =
+        typeof v2AgentDomain.get === "function" ? v2AgentDomain.get(entry.id) : undefined
+      const model = (record as { model?: unknown } | undefined)?.model
+      let modelStr: string | undefined
+      if (typeof model === "string") modelStr = model
+      else if (
+        model &&
+        typeof model === "object" &&
+        typeof (model as { id?: unknown }).id === "string" &&
+        typeof (model as { providerID?: unknown }).providerID === "string"
+      ) {
+        modelStr = `${(model as { providerID: string }).providerID}/${(model as { id: string }).id}`
+      }
+      if (modelStr !== undefined) {
+        state.agents.set(entry.id, configuredModelVisionCapable(modelStr, v2CatalogRef, v2OptionsConfigRef))
+      }
+    }
+  } catch {
+    // Drift degrades to the existing map, never throws.
   }
 }
 
@@ -1208,14 +1375,13 @@ async function v2Setup(ctx: V2PluginContext): Promise<void> {
     agents: new Map<string, boolean>(),
     default: configuredModelVisionCapable(optionsConfig.model, catalog, optionsConfig),
   }
-  let v2Knobs: VisionToolKnobs = {
-    disabled: false,
-    model: undefined,
-    temperature: undefined,
-    extraBody: undefined,
-    config: optionsConfig,
-    catalog,
-  }
+  // Lazy-resolution seams (fix-v2-knob-capture-timing): the domain handle and
+  // the config/catalog pair are published to module state so resolveV2Knobs()
+  // can read the MERGED vision-agent record at tool-execute time.
+  v2AgentDomain = ctx.agent
+  v2CatalogRef = catalog
+  v2OptionsConfigRef = optionsConfig
+  v2TransformKnobs = undefined
 
   // Same registration contract as the v1 config hook: register the
   // vision-agent subagent only when absent (the user's own config and the
@@ -1224,19 +1390,15 @@ async function v2Setup(ctx: V2PluginContext): Promise<void> {
   // `prompt`), `mode`, `hidden`, `permissions`.
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform(async (draft) => {
-      // Knob capture (task 2.4): read-only snapshot of the user's
-      // vision-agent record — the plugin never writes these fields. Runs
-      // whether or not the create-only registration below fires, so an
-      // existing user record still supplies the tool's model.
+      // Knob capture (fix-v2-knob-capture-timing): the transform-time read is
+      // kept as a MIDDLE source for hosts whose drafts already carry the
+      // record — but on hosts that merge user config AFTER plugin transforms
+      // (observed 2.3.2) this is undefined here and the merged record is read
+      // lazily at execute time via resolveV2Knobs().
       if (typeof draft.get === "function") {
         const record = draft.get("vision-agent")
         if (record !== undefined) {
-          const knobs = readV2AgentKnobs(record)
-          v2Knobs = {
-            ...knobs,
-            config: optionsConfig,
-            catalog,
-          }
+          v2TransformKnobs = readV2AgentKnobs(record)
         }
       }
       // Agent-name -> capability map for message routing (RV-1 order step 2):
@@ -1296,8 +1458,11 @@ async function v2Setup(ctx: V2PluginContext): Promise<void> {
   // Register vision_analyze via ctx.tool.transform (task 2.1): same shared
   // execute core and error-category prefixes as the v1 tool; the JSON Schema
   // input mirrors the v1 tool.schema chain. A disabled vision-agent record
-  // suppresses the registration entirely (VT-2/RV-6).
-  if (!v2Knobs.disabled && typeof ctx.tool?.transform === "function") {
+  // suppresses the registration entirely (VT-2/RV-6) — the gate resolves
+  // lazily too, so a config-merged disable that was invisible at transform
+  // time is still observed here via the domain getter / config-file fallback.
+  // The execute core independently guards the disabled state.
+  if (!resolveV2Knobs().disabled && typeof ctx.tool?.transform === "function") {
     await ctx.tool.transform(async (editor) => {
       if (typeof editor?.add !== "function") return
       editor.add({
@@ -1308,7 +1473,7 @@ async function v2Setup(ctx: V2PluginContext): Promise<void> {
           const text = await runVisionAnalyze(
             args as VisionAnalyzeArgs,
             (toolCtx ?? {}) as VisionAnalyzeCtx,
-            v2Knobs,
+            resolveV2Knobs(),
           )
           return wrapV2ToolResult(text)
         },
@@ -1321,9 +1486,14 @@ async function v2Setup(ctx: V2PluginContext): Promise<void> {
     ctx.permission.hook("evaluate", (event) => v2PermissionEvaluate(event))
   }
   // RV-1/RV-2 routing seam (task 2.3): system instruction + image
-  // materialization via one context hook.
+  // materialization via one context hook. The agent-name capability map is
+  // refreshed post-merge first (fix-v2-knob-capture-timing task 2.2) wherever
+  // the domain exposes list/get outside transform.
   if (typeof ctx.session?.hook === "function") {
-    ctx.session.hook("context", (event) => v2SessionContext(event, v2Capability))
+    ctx.session.hook("context", (event) => {
+      refreshV2AgentsMap(v2Capability)
+      v2SessionContext(event, v2Capability)
+    })
   }
 }
 

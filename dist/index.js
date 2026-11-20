@@ -13099,6 +13099,9 @@ function homeDir() {
 function xdgPath(kind, fallback) {
   return process.env[kind] ?? join(homeDir(), fallback);
 }
+function opencodeConfigDir() {
+  return resolve(process.env.OPENCODE_CONFIG_DIR ?? join(xdgPath("XDG_CONFIG_HOME", ".config"), "opencode"));
+}
 function opencodeCacheDir() {
   return resolve(join(xdgPath("XDG_CACHE_HOME", ".cache"), "opencode"));
 }
@@ -13570,6 +13573,116 @@ function readV2AgentKnobs(record2) {
     extraBody: agent.request?.body && typeof agent.request.body === "object" && !Array.isArray(agent.request.body) ? agent.request.body : agent.extraBody && typeof agent.extraBody === "object" && !Array.isArray(agent.extraBody) ? agent.extraBody : undefined
   };
 }
+var v2AgentDomain;
+var v2CatalogRef = {};
+var v2OptionsConfigRef = {};
+var v2TransformKnobs;
+function stripJsoncForParse(text) {
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') {
+      out += c;
+      i++;
+      while (i < n && text[i] !== '"') {
+        if (text[i] === "\\") {
+          out += text[i];
+          i++;
+        }
+        out += text[i];
+        i++;
+      }
+      out += text[i] ?? "";
+      i++;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < n && text[i] !== `
+`)
+        i++;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(text[i] === "*" && text[i + 1] === "/"))
+        i++;
+      i += 2;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out.replace(/,(\s*[}\]])/g, "$1");
+}
+function readOpencodeConfigFile() {
+  const dir = opencodeConfigDir();
+  for (const file2 of [join(dir, "opencode.json"), join(dir, "opencode.jsonc")]) {
+    try {
+      if (!existsSync(file2))
+        continue;
+      const parsed = JSON.parse(stripJsoncForParse(readFileSync2(file2, "utf8")));
+      if (parsed && typeof parsed === "object")
+        return parsed;
+    } catch {
+      continue;
+    }
+  }
+  return;
+}
+function resolveV2Knobs() {
+  const base = { config: v2OptionsConfigRef, catalog: v2CatalogRef };
+  try {
+    if (typeof v2AgentDomain?.get === "function") {
+      const record2 = v2AgentDomain.get("vision-agent");
+      if (record2 !== undefined) {
+        return { ...readV2AgentKnobs(record2), ...base };
+      }
+    }
+  } catch {}
+  if (v2TransformKnobs)
+    return { ...v2TransformKnobs, ...base };
+  const fileConfig = readOpencodeConfigFile();
+  if (fileConfig) {
+    const entry = fileConfig.agent?.["vision-agent"];
+    if (entry !== undefined) {
+      const knobs = readV2AgentKnobs(entry);
+      if (knobs.model !== undefined || knobs.disabled || knobs.temperature !== undefined || knobs.extraBody !== undefined) {
+        return { ...knobs, config: { ...v2OptionsConfigRef, ...fileConfig }, catalog: v2CatalogRef };
+      }
+    }
+  }
+  return {
+    disabled: false,
+    model: undefined,
+    temperature: undefined,
+    extraBody: undefined,
+    ...base
+  };
+}
+function refreshV2AgentsMap(state) {
+  try {
+    if (typeof v2AgentDomain?.list !== "function")
+      return;
+    const entries = v2AgentDomain.list() ?? [];
+    for (const entry of entries) {
+      if (!entry || typeof entry.id !== "string")
+        continue;
+      const record2 = typeof v2AgentDomain.get === "function" ? v2AgentDomain.get(entry.id) : undefined;
+      const model = record2?.model;
+      let modelStr;
+      if (typeof model === "string")
+        modelStr = model;
+      else if (model && typeof model === "object" && typeof model.id === "string" && typeof model.providerID === "string") {
+        modelStr = `${model.providerID}/${model.id}`;
+      }
+      if (modelStr !== undefined) {
+        state.agents.set(entry.id, configuredModelVisionCapable(modelStr, v2CatalogRef, v2OptionsConfigRef));
+      }
+    }
+  } catch {}
+}
 function v2PermissionEvaluate(event) {
   try {
     const e = event ?? {};
@@ -13654,25 +13767,16 @@ async function v2Setup(ctx) {
     agents: new Map,
     default: configuredModelVisionCapable(optionsConfig.model, catalog, optionsConfig)
   };
-  let v2Knobs = {
-    disabled: false,
-    model: undefined,
-    temperature: undefined,
-    extraBody: undefined,
-    config: optionsConfig,
-    catalog
-  };
+  v2AgentDomain = ctx.agent;
+  v2CatalogRef = catalog;
+  v2OptionsConfigRef = optionsConfig;
+  v2TransformKnobs = undefined;
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform(async (draft) => {
       if (typeof draft.get === "function") {
         const record2 = draft.get("vision-agent");
         if (record2 !== undefined) {
-          const knobs = readV2AgentKnobs(record2);
-          v2Knobs = {
-            ...knobs,
-            config: optionsConfig,
-            catalog
-          };
+          v2TransformKnobs = readV2AgentKnobs(record2);
         }
       }
       if (typeof draft.list === "function") {
@@ -13718,7 +13822,7 @@ async function v2Setup(ctx) {
       } catch {}
     });
   }
-  if (!v2Knobs.disabled && typeof ctx.tool?.transform === "function") {
+  if (!resolveV2Knobs().disabled && typeof ctx.tool?.transform === "function") {
     await ctx.tool.transform(async (editor) => {
       if (typeof editor?.add !== "function")
         return;
@@ -13727,7 +13831,7 @@ async function v2Setup(ctx) {
         description: VISION_TOOL_DESCRIPTION,
         input: VISION_ANALYZE_INPUT_SCHEMA,
         async execute(args, toolCtx) {
-          const text = await runVisionAnalyze(args, toolCtx ?? {}, v2Knobs);
+          const text = await runVisionAnalyze(args, toolCtx ?? {}, resolveV2Knobs());
           return wrapV2ToolResult(text);
         }
       });
@@ -13737,10 +13841,16 @@ async function v2Setup(ctx) {
     ctx.permission.hook("evaluate", (event) => v2PermissionEvaluate(event));
   }
   if (typeof ctx.session?.hook === "function") {
-    ctx.session.hook("context", (event) => v2SessionContext(event, v2Capability));
+    ctx.session.hook("context", (event) => {
+      refreshV2AgentsMap(v2Capability);
+      v2SessionContext(event, v2Capability);
+    });
   }
 }
 var plugin_default = { id: "vision", server: plugin, setup: v2Setup };
 export {
+  stripJsoncForParse,
+  resolveV2Knobs,
+  refreshV2AgentsMap,
   plugin_default as default
 };
