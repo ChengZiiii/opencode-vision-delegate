@@ -75,6 +75,14 @@ opencode plugin opencode-vision-delegate --global
 
 Then restart opencode and verify with `opencode agent list`.
 
+Additionally (verified on the 2.x installer): `opencode plugin add` APPENDS —
+a bare `opencode plugin opencode-vision-delegate --global` over an existing
+entry fails with `Duplicate plugin ID: vision`. Remove the old `plugin`-array
+entry first (uninstall step 1 below), then install. `remove` only removes
+the config entry of its own registered source, and the store path follows
+the specifier spelling — switching between npm and github sources leaves
+both store dirs behind, delete the stale one.
+
 opencode 1.18 has **no built-in plugin uninstall command**. To uninstall manually (verified working):
 
 1. Remove the entry from the `plugin` array in your opencode config (`~/.config/opencode/opencode.json` for global, `.opencode/opencode.json` for project).
