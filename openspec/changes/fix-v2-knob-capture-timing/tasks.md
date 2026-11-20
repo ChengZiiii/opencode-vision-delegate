@@ -40,6 +40,12 @@
 - [x] 4.1 `bun run bundle` (self-contained dist, no `--packages external`).
 - [ ] 4.2 Live verify on the real 2.3.2 host: `vision_analyze` resolves
   the configured model and returns analysis for a dropped image.
-- [ ] 4.3 Release per README flow (version bump → bundle → npm publish →
+  (Merged-face visibility covered — the npm-name final smoke shows the
+  config model on the merged vision-agent record with 0.3.1 active.
+  The dropped-image execute leg needs a live LLM session; the
+  P2-design note records that either resolution layer yields identical
+  values.)
+- [x] 4.3 Release per README flow (version bump → bundle → npm publish →
   store reinstall via official `opencode plugin` mode) — only after
-  user approval of this proposal.
+  user approval of this proposal. (0.3.1 published + npm-name final
+  install retained, 2026-11-21, user-approved.)
