@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-20
+goal: vision_analyze honors agent[vision-agent].model on real v2 hosts
+  regardless of config-merge ordering
