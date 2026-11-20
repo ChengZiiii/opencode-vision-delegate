@@ -61,3 +61,43 @@ Knobs become a function of the record at EXECUTE time, not a snapshot:
   with the merge-after-transform ordering the registration firing for a
   config-defined entry is harmless today (fields merge over it) and its
   full treatment belongs to a host-behavior discussion, not this fix.
+
+## Probe resolution (task 1.1 / 1.2 — live session, 2026-11-20)
+
+- **1.1 (domain getter outside transform)**: the config → agent merge is
+  the built-in plugin `opencode.agent`'s `agent.transform`, running AFTER
+  ordinary plugin transforms. A plugin's `ctx.agent.transform` therefore
+  observes `draft.get("vision-agent") === undefined` for config-defined
+  entries while the final merged record carries the config's
+  `model {id, providerID, variant}`. Since every plugin transform has
+  finished by the time any tool `execute` runs, the merged record is
+  guaranteed settled at the agent layer at execute time — the domain
+  getter at execute time is the primary resolution source (kept behind a
+  `typeof get === "function"` guard with a config-file fallback, so hosts
+  whose domains expose no getter degrade gracefully).
+- **1.2 (config discovery)**: `ctx.options` on 2.3.2 is an EMPTY object
+  (not the user config). The fallback reads the host's global config file
+  exactly as the host documents discovery: `OPENCODE_CONFIG_DIR` when set,
+  else `~/.config/opencode/opencode.json(c)`. JSONC comments and trailing
+  commas are stripped before `JSON.parse`; only
+  `agent["vision-agent"].{model,disable,disabled,temperature,extraBody}`
+  are read; the file is never written.
+- Agent record `model` object shape `{id, providerID, variant}` folds to
+  `"providerID/id"` (the `variant` field is ignored by the fold) — reuse of
+  the existing `readV2AgentKnobs` folding.
+
+## Implementation notes (apply phase)
+
+- Source order in `resolveV2Knobs()`: domain getter → transform-time
+  snapshot → config-file fallback → unset. The transform-time snapshot is
+  retained as a middle source because on hosts whose drafts already carry
+  the record it is a valid observation, and keeping it preserves behavior
+  for the existing wired-test legs.
+- The registration-time disabled gate also resolves lazily
+  (`if (!resolveV2Knobs().disabled …)`), and `runVisionAnalyze`
+  independently guards `disabled` at execute time — a config-merged
+  disable that was invisible at transform time is still observed.
+- Capability map (task 2.2): BOTH deferred-refresh and documented
+  limitation — `refreshV2AgentsMap()` re-reads the domain `list`/`get` at
+  every session-context hook when available; on hosts without a post-merge
+  list the transform-time map persists (README documents the limitation).
