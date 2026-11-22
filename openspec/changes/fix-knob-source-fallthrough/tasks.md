@@ -45,7 +45,7 @@
 - [x] 4.3 Quarantine the host cache copy of 0.3.1 (rename into
       `_quarantine`, never delete); config already points at the
       unversioned npm specifier.
-- [ ] 4.4 User restarts (shared with forge 0.32.1) and calls vision_analyze
+- [x] 4.4 User restarts (shared with forge 0.32.1) and calls vision_analyze
       on a real screenshot: a verdict comes back (no `model not
       configured`). The palette screenshot leg (previously blocked on this
       fix) unblocks at the same restart.
