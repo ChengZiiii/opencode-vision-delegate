@@ -13478,8 +13478,9 @@ var plugin = async () => ({
     v1Capability.agents = new Map;
     const agentsSection = cfg.agent ?? {};
     for (const [name, entry] of Object.entries(agentsSection)) {
-      if (entry && typeof entry.model === "string") {
-        v1Capability.agents.set(name, configuredModelVisionCapable(entry.model, catalog, cfg));
+      const modelRef = readAgentModelRef(entry?.model);
+      if (modelRef !== undefined) {
+        v1Capability.agents.set(name, configuredModelVisionCapable(modelRef, catalog, cfg));
       }
     }
     const cfgAny = cfg;
@@ -13499,7 +13500,7 @@ var plugin = async () => ({
       permission: PERMISSION
     });
     const visionAgent = cfg.agent["vision-agent"];
-    visionToolModel = typeof visionAgent?.model === "string" && visionAgent.model ? visionAgent.model : undefined;
+    visionToolModel = readAgentModelRef(visionAgent?.model);
     visionToolDisabled = visionAgent?.disable === true;
     visionToolTemperature = typeof visionAgent?.temperature === "number" && Number.isFinite(visionAgent.temperature) ? visionAgent.temperature : undefined;
     visionToolExtraBody = visionAgent?.extraBody && typeof visionAgent.extraBody === "object" && !Array.isArray(visionAgent.extraBody) ? visionAgent.extraBody : undefined;
@@ -13556,15 +13557,23 @@ var VISION_ANALYZE_INPUT_SCHEMA = {
 function wrapV2ToolResult(text) {
   return { content: text };
 }
+function readAgentModelRef(model) {
+  if (typeof model === "string" && model)
+    return model;
+  if (model && typeof model === "object") {
+    const m = model;
+    if (typeof m.providerID !== "string" || !m.providerID)
+      return;
+    const id = typeof m.id === "string" && m.id ? m.id : typeof m.modelID === "string" && m.modelID ? m.modelID : undefined;
+    if (!id)
+      return;
+    return `${m.providerID}/${id}`;
+  }
+  return;
+}
 function readV2AgentKnobs(record2) {
   const agent = record2 ?? {};
-  let model;
-  const m = agent.model;
-  if (typeof m === "string" && m)
-    model = m;
-  else if (m && typeof m === "object" && typeof m.id === "string" && typeof m.providerID === "string") {
-    model = `${m.providerID}/${m.id}`;
-  }
+  const model = readAgentModelRef(agent.model);
   const temperatureCandidate = agent.request?.settings?.temperature;
   return {
     model,
@@ -13633,22 +13642,25 @@ function readOpencodeConfigFile() {
 }
 function resolveV2Knobs() {
   const base = { config: v2OptionsConfigRef, catalog: v2CatalogRef };
+  const wins = (k) => k.model !== undefined || k.disabled;
   try {
     if (typeof v2AgentDomain?.get === "function") {
       const record2 = v2AgentDomain.get("vision-agent");
       if (record2 !== undefined) {
-        return { ...readV2AgentKnobs(record2), ...base };
+        const knobs = { ...readV2AgentKnobs(record2), ...base };
+        if (wins(knobs))
+          return knobs;
       }
     }
   } catch {}
-  if (v2TransformKnobs)
+  if (v2TransformKnobs && wins(v2TransformKnobs))
     return { ...v2TransformKnobs, ...base };
   const fileConfig = readOpencodeConfigFile();
   if (fileConfig) {
     const entry = fileConfig.agent?.["vision-agent"];
     if (entry !== undefined) {
       const knobs = readV2AgentKnobs(entry);
-      if (knobs.model !== undefined || knobs.disabled || knobs.temperature !== undefined || knobs.extraBody !== undefined) {
+      if (wins(knobs)) {
         return { ...knobs, config: { ...v2OptionsConfigRef, ...fileConfig }, catalog: v2CatalogRef };
       }
     }
@@ -13671,12 +13683,7 @@ function refreshV2AgentsMap(state) {
         continue;
       const record2 = typeof v2AgentDomain.get === "function" ? v2AgentDomain.get(entry.id) : undefined;
       const model = record2?.model;
-      let modelStr;
-      if (typeof model === "string")
-        modelStr = model;
-      else if (model && typeof model === "object" && typeof model.id === "string" && typeof model.providerID === "string") {
-        modelStr = `${model.providerID}/${model.id}`;
-      }
+      const modelStr = readAgentModelRef(model);
       if (modelStr !== undefined) {
         state.agents.set(entry.id, configuredModelVisionCapable(modelStr, v2CatalogRef, v2OptionsConfigRef));
       }
@@ -13784,9 +13791,9 @@ async function v2Setup(ctx) {
           if (!entry || typeof entry.id !== "string")
             continue;
           const record2 = typeof draft.get === "function" ? draft.get(entry.id) : undefined;
-          const model = record2?.model;
-          if (typeof model === "string") {
-            v2Capability.agents.set(entry.id, configuredModelVisionCapable(model, catalog, optionsConfig));
+          const modelRef = readAgentModelRef(record2?.model);
+          if (modelRef !== undefined) {
+            v2Capability.agents.set(entry.id, configuredModelVisionCapable(modelRef, catalog, optionsConfig));
           }
         }
       }

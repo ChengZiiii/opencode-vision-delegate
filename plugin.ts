@@ -748,11 +748,11 @@ const plugin: Plugin = async () => ({
     agent?: Record<string, { model?: string } | undefined>
   }).agent ?? {}
   for (const [name, entry] of Object.entries(agentsSection)) {
-    if (entry && typeof entry.model === "string") {
-      v1Capability.agents.set(
-        name,
-        configuredModelVisionCapable(entry.model, catalog, cfg as ConfigLike),
-      )
+    // readAgentModelRef: string passthrough + host object spellings
+    // ({providerID, id} normalized / {providerID, modelID} raw config).
+    const modelRef = readAgentModelRef((entry as { model?: unknown } | undefined)?.model)
+    if (modelRef !== undefined) {
+      v1Capability.agents.set(name, configuredModelVisionCapable(modelRef, catalog, cfg as ConfigLike))
     }
   }
 
@@ -796,12 +796,12 @@ const plugin: Plugin = async () => ({
 
   // Capture the tool's model source and request knobs (and the disable flag)
   // from the user's vision-agent override. Read-only: the plugin never
-  // writes these.
+  // writes these. readAgentModelRef accepts the plain string AND the host
+  // object spellings (fix-knob-source-fallthrough).
   const visionAgent = cfg.agent["vision-agent"] as
-    | { model?: string; disable?: boolean; temperature?: number; extraBody?: Record<string, unknown> }
+    | { model?: unknown; disable?: boolean; temperature?: number; extraBody?: Record<string, unknown> }
     | undefined
-  visionToolModel =
-    typeof visionAgent?.model === "string" && visionAgent.model ? visionAgent.model : undefined
+  visionToolModel = readAgentModelRef(visionAgent?.model)
   visionToolDisabled = visionAgent?.disable === true
   visionToolTemperature =
     typeof visionAgent?.temperature === "number" && Number.isFinite(visionAgent.temperature)
@@ -994,6 +994,25 @@ function wrapV2ToolResult(text: string): { content: string } {
 // disabled config agent is excluded from the domain before plugins see it,
 // so the disable read stays a defensive leg. Legacy flat fields
 // (model as string / temperature / extraBody) are kept as drift fallbacks.
+// readAgentModelRef: the ONE model-reference reader every capture site uses.
+// Accepts the plain string; folds the host object spellings {providerID, id}
+// (normalized) and {providerID, modelID} (raw config) to
+// "providerID/modelID-or-id". Anything else -> undefined. Ground truth
+// (fix-knob-source-fallthrough probe, 2.3.2): the config stores the string,
+// /api/agent serializes {providerID, id, variant}, and the domain record can
+// carry neither — all three spellings must resolve identically.
+function readAgentModelRef(model: unknown): string | undefined {
+  if (typeof model === "string" && model) return model
+  if (model && typeof model === "object") {
+    const m = model as { providerID?: unknown; id?: unknown; modelID?: unknown }
+    if (typeof m.providerID !== "string" || !m.providerID) return undefined
+    const id = typeof m.id === "string" && m.id ? m.id : typeof m.modelID === "string" && m.modelID ? m.modelID : undefined
+    if (!id) return undefined
+    return `${m.providerID}/${id}`
+  }
+  return undefined
+}
+
 function readV2AgentKnobs(record: unknown): {
   model: string | undefined
   disabled: boolean
@@ -1012,18 +1031,9 @@ function readV2AgentKnobs(record: unknown): {
     }
   }
   // model: object form {id, providerID} folds to "providerID/id"; a plain
-  // string (older/flat shape) passes through.
-  let model: string | undefined
-  const m = agent.model
-  if (typeof m === "string" && m) model = m
-  else if (
-    m &&
-    typeof m === "object" &&
-    typeof (m as { id?: unknown }).id === "string" &&
-    typeof (m as { providerID?: unknown }).providerID === "string"
-  ) {
-    model = `${(m as { providerID: string }).providerID}/${(m as { id: string }).id}`
-  }
+  // string (older/flat shape) passes through; {providerID, modelID} (raw
+  // config spelling) folds identically (readAgentModelRef).
+  const model = readAgentModelRef(agent.model)
   const temperatureCandidate = agent.request?.settings?.temperature
   return {
     model,
@@ -1136,23 +1146,31 @@ function readOpencodeConfigFile(): OpencodeFileConfig | undefined {
 //      guidance); no default model is ever invented.
 export function resolveV2Knobs(): VisionToolKnobs {
   const base = { config: v2OptionsConfigRef, catalog: v2CatalogRef }
+  // Win condition (fix-knob-source-fallthrough): a source wins only when it
+  // actually yields usable knobs — the model reference, or an explicit
+  // disable. Ground truth (2.3.2 probe): the agent-domain getter returns a
+  // PRESENT record with NO knobs for config-defined agents; treating presence
+  // as success early-returned model:undefined and starved the file fallback.
+  // A disabled record must still win instantly (never bypassable below).
+  const wins = (k: { model: string | undefined; disabled: boolean }) => k.model !== undefined || k.disabled
   try {
     if (typeof v2AgentDomain?.get === "function") {
       const record = v2AgentDomain.get("vision-agent")
       if (record !== undefined) {
-        return { ...readV2AgentKnobs(record), ...base }
+        const knobs = { ...readV2AgentKnobs(record), ...base }
+        if (wins(knobs)) return knobs
       }
     }
   } catch {
     // Domain drift/thrown getter degrades to the next source, never throws.
   }
-  if (v2TransformKnobs) return { ...v2TransformKnobs, ...base }
+  if (v2TransformKnobs && wins(v2TransformKnobs)) return { ...v2TransformKnobs, ...base }
   const fileConfig = readOpencodeConfigFile()
   if (fileConfig) {
     const entry = fileConfig.agent?.["vision-agent"]
     if (entry !== undefined) {
       const knobs = readV2AgentKnobs(entry)
-      if (knobs.model !== undefined || knobs.disabled || knobs.temperature !== undefined || knobs.extraBody !== undefined) {
+      if (wins(knobs)) {
         return { ...knobs, config: { ...v2OptionsConfigRef, ...fileConfig }, catalog: v2CatalogRef }
       }
     }
@@ -1183,16 +1201,7 @@ export function refreshV2AgentsMap(state: VisionCapabilityState): void {
       const record =
         typeof v2AgentDomain.get === "function" ? v2AgentDomain.get(entry.id) : undefined
       const model = (record as { model?: unknown } | undefined)?.model
-      let modelStr: string | undefined
-      if (typeof model === "string") modelStr = model
-      else if (
-        model &&
-        typeof model === "object" &&
-        typeof (model as { id?: unknown }).id === "string" &&
-        typeof (model as { providerID?: unknown }).providerID === "string"
-      ) {
-        modelStr = `${(model as { providerID: string }).providerID}/${(model as { id: string }).id}`
-      }
+      const modelStr = readAgentModelRef(model)
       if (modelStr !== undefined) {
         state.agents.set(entry.id, configuredModelVisionCapable(modelStr, v2CatalogRef, v2OptionsConfigRef))
       }
@@ -1407,12 +1416,9 @@ async function v2Setup(ctx: V2PluginContext): Promise<void> {
         for (const entry of draft.list() ?? []) {
           if (!entry || typeof entry.id !== "string") continue
           const record = typeof draft.get === "function" ? draft.get(entry.id) : undefined
-          const model = (record as { model?: unknown } | undefined)?.model
-          if (typeof model === "string") {
-            v2Capability.agents.set(
-              entry.id,
-              configuredModelVisionCapable(model, catalog, optionsConfig),
-            )
+          const modelRef = readAgentModelRef((record as { model?: unknown } | undefined)?.model)
+          if (modelRef !== undefined) {
+            v2Capability.agents.set(entry.id, configuredModelVisionCapable(modelRef, catalog, optionsConfig))
           }
         }
       }

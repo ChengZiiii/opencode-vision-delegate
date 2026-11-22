@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-22
+goal: vision_analyze resolves the user's agent[vision-agent].model override on
+  2.3.2 regardless of the domain record's knob-less skeleton

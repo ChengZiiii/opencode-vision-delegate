@@ -401,6 +401,98 @@ test("v2 knobs: not-image-capable model -> VT-2 error category", async () => {
   assert.equal(captured.length, 0)
 })
 
+// --- fix-knob-source-fallthrough: presence is not resolution ---------------
+
+// Ground truth (probe 2026-11-22): the 2.3.2 agent-domain getter returns a
+// PRESENT record with NO knobs for config-defined agents. The old resolver
+// early-returned model:undefined on presence and starved the config-file
+// fallback, producing the production tier-1 error. The override was one
+// fall-through away.
+test("v2 knobs fallthrough: model-less domain record -> config file fallback resolves the override", async () => {
+  const { ctx, state } = makeCtx()
+  // the observed 2.3.2 skeleton: present, enumerable-empty, model-less
+  state.agents.set("vision-agent", {})
+  const cfgFile = join(configTmp, "opencode.json")
+  writeFileSync(cfgFile, JSON.stringify({ agent: { "vision-agent": { model: "fakeprov/vm" } } }))
+  try {
+    await pluginEntry.setup(ctx)
+    stubFetch()
+    await state.tools[0].execute(
+      { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+      { directory: tmp },
+    )
+    const body = JSON.parse(captured[0].body)
+    assert.equal(body.model, "vm", "the file fallback resolved the override the domain record lacked")
+    assert.equal(captured.length, 1, "exactly one HTTP request — no tier-1 error")
+  } finally {
+    rmSync(cfgFile, { force: true })
+  }
+})
+
+test("v2 knobs fallthrough: model-less domain record + raw-config {providerID, modelID} file spelling also resolves", async () => {
+  const { ctx, state } = makeCtx()
+  state.agents.set("vision-agent", {})
+  const cfgFile = join(configTmp, "opencode.json")
+  writeFileSync(cfgFile, JSON.stringify({ agent: { "vision-agent": { model: { providerID: "fakeprov", modelID: "vm" } } } }))
+  try {
+    await pluginEntry.setup(ctx)
+    stubFetch()
+    await state.tools[0].execute(
+      { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+      { directory: tmp },
+    )
+    assert.equal(JSON.parse(captured[0].body).model, "vm")
+  } finally {
+    rmSync(cfgFile, { force: true })
+  }
+})
+
+test("v2 knobs fallthrough: a disabled domain record wins instantly (file fallback cannot re-enable)", async () => {
+  const { ctx, state } = makeCtx()
+  state.agents.set("vision-agent", { disabled: true })
+  const cfgFile = join(configTmp, "opencode.json")
+  writeFileSync(cfgFile, JSON.stringify({ agent: { "vision-agent": { model: "fakeprov/vm" } } }))
+  try {
+    await pluginEntry.setup(ctx)
+    assert.equal(state.tools.length, 0, "disabled record suppresses tool registration")
+  } finally {
+    rmSync(cfgFile, { force: true })
+  }
+})
+
+test("v2 knobs precedence: a domain record WITH model still beats the config file", async () => {
+  const { ctx, state } = makeCtx()
+  state.agents.set("vision-agent", { model: { id: "vm", providerID: "fakeprov" } })
+  const cfgFile = join(configTmp, "opencode.json")
+  writeFileSync(cfgFile, JSON.stringify({ agent: { "vision-agent": { model: "fakeprov/tm" } } }))
+  try {
+    await pluginEntry.setup(ctx)
+    stubFetch()
+    await state.tools[0].execute(
+      { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+      { directory: tmp },
+    )
+    assert.equal(JSON.parse(captured[0].body).model, "vm", "domain record (merged truth) outranks the file")
+  } finally {
+    rmSync(cfgFile, { force: true })
+  }
+})
+
+test("v2 knobs fallthrough: knob-less record + no config file -> exact unset error (honest degradation intact)", async () => {
+  const { ctx, state } = makeCtx()
+  state.agents.set("vision-agent", {})
+  await pluginEntry.setup(ctx)
+  stubFetch()
+  await assert.rejects(
+    state.tools[0].execute(
+      { images: [{ id: "a", path: PNG_PATH }], question: "q", response_template: "{}" },
+      { directory: tmp },
+    ),
+    /vision_analyze: model not configured: set agent\["vision-agent"\]\.model/,
+  )
+  assert.equal(captured.length, 0)
+})
+
 // --- 2.5 agent + skill registrations kept ----------------------------------
 
 test("v2 agent + skill kept: create-only vision-agent registration + embedded skill (observed draft.add shape)", async () => {
