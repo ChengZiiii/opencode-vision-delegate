@@ -38,11 +38,11 @@
 
 ## 4. Release (④ GATE — npm ladder, user-authorized)
 
-- [ ] 4.1 Version 0.3.1 → 0.3.2 (`chore: release 0.3.2` commit, dist
+- [x] 4.1 Version 0.3.1 → 0.3.2 (`chore: release 0.3.2` commit, dist
       bundled in).
-- [ ] 4.2 `npm pack --dry-run` whitelist check → publish from the tgz →
+- [x] 4.2 `npm pack --dry-run` whitelist check → publish from the tgz →
       poll `dist-tags` until `latest = 0.3.2`; report shasum for 对账.
-- [ ] 4.3 Quarantine the host cache copy of 0.3.1 (rename into
+- [x] 4.3 Quarantine the host cache copy of 0.3.1 (rename into
       `_quarantine`, never delete); config already points at the
       unversioned npm specifier.
 - [ ] 4.4 User restarts (shared with forge 0.32.1) and calls vision_analyze
